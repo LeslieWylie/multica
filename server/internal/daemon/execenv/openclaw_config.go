@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -29,9 +30,36 @@ const openclawConfigFile = "openclaw-config.json"
 const openclawUserSnapshotFile = "openclaw-user-snapshot.json"
 
 // openclawCLITimeout caps each `openclaw config ...` invocation during task
-// setup. The CLI is fast (<200ms normal); 5s leaves headroom for a cold
-// node start without letting a hung CLI stall task dispatch indefinitely.
-const openclawCLITimeout = 5 * time.Second
+// setup. Override with MULTICA_OPENCLAW_CLI_TIMEOUT_SECONDS when the
+// installed openclaw CLI's cold start doesn't fit the default — measured
+// 2.4-4.2s alone and 7+s under concurrent task dispatch on stock hardware,
+// which leaves little headroom above this default and fails outright under
+// concurrency (see openclawCLITimeoutFromEnv). The original assumption that
+// the CLI is fast (<200ms) no longer holds for current openclaw versions;
+// `config` subcommands are not on openclaw's own precomputed-help fast path
+// (unlike --version/--help), so every invocation pays full module load cost.
+var openclawCLITimeout = openclawCLITimeoutFromEnv()
+
+const (
+	envOpenclawCLITimeoutSeconds     = "MULTICA_OPENCLAW_CLI_TIMEOUT_SECONDS"
+	defaultOpenclawCLITimeoutSeconds = 5
+)
+
+// openclawCLITimeoutFromEnv reads MULTICA_OPENCLAW_CLI_TIMEOUT_SECONDS (a
+// positive integer number of seconds) or falls back to
+// defaultOpenclawCLITimeoutSeconds. An unset, empty, non-numeric, or
+// non-positive value falls back rather than erroring — this is a task-prep
+// timeout, not a correctness-critical setting, so a malformed override
+// should degrade to the default instead of failing daemon startup.
+func openclawCLITimeoutFromEnv() time.Duration {
+	if raw := strings.TrimSpace(os.Getenv(envOpenclawCLITimeoutSeconds)); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			return time.Duration(n) * time.Second
+		}
+	}
+	return defaultOpenclawCLITimeoutSeconds * time.Second
+}
+
 
 // OpenclawConfigPrep is the input to prepareOpenclawConfig. Only OpenclawBin
 // is meaningful in production — Timeout is here for tests that need a tight
