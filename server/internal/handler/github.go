@@ -55,8 +55,12 @@ type GitHubInstallationResponse struct {
 }
 
 type GitHubPullRequestResponse struct {
-	ID              string  `json:"id"`
-	WorkspaceID     string  `json:"workspace_id"`
+	ID          string `json:"id"`
+	WorkspaceID string `json:"workspace_id"`
+	// Provider is "github" or "gitlab" (see migration 128 — this table
+	// mirrors both providers' PR/MR state under one shape). Defaults to
+	// "github" on rows that predate the column.
+	Provider        string  `json:"provider"`
 	RepoOwner       string  `json:"repo_owner"`
 	RepoName        string  `json:"repo_name"`
 	Number          int32   `json:"number"`
@@ -128,6 +132,7 @@ func githubPullRequestToResponse(p db.GithubPullRequest) GitHubPullRequestRespon
 	return GitHubPullRequestResponse{
 		ID:              uuidToString(p.ID),
 		WorkspaceID:     uuidToString(p.WorkspaceID),
+		Provider:        p.Provider,
 		RepoOwner:       p.RepoOwner,
 		RepoName:        p.RepoName,
 		Number:          p.PrNumber,
@@ -156,6 +161,7 @@ func issuePullRequestRowToResponse(p db.ListPullRequestsByIssueRow) GitHubPullRe
 	return GitHubPullRequestResponse{
 		ID:               uuidToString(p.ID),
 		WorkspaceID:      uuidToString(p.WorkspaceID),
+		Provider:         p.Provider,
 		RepoOwner:        p.RepoOwner,
 		RepoName:         p.RepoName,
 		Number:           p.PrNumber,
@@ -827,7 +833,7 @@ func (h *Handler) handlePullRequestEvent(ctx context.Context, body []byte) {
 	mergeable, clearMergeable := derivePRMergeableState(p.Action, p.PullRequest.MergeableState, baseRefChanged(p.Changes))
 	pr, err := h.Queries.UpsertGitHubPullRequest(ctx, db.UpsertGitHubPullRequestParams{
 		WorkspaceID:         wsID,
-		InstallationID:      inst.InstallationID,
+		InstallationID:      pgtype.Int8{Int64: inst.InstallationID, Valid: true},
 		RepoOwner:           p.Repository.Owner.Login,
 		RepoName:            p.Repository.Name,
 		PrNumber:            p.PullRequest.Number,
@@ -950,7 +956,7 @@ func (h *Handler) handlePullRequestEvent(ctx context.Context, body []byte) {
 					continue
 				}
 				if counts.OpenCount == 0 && counts.MergedWithCloseIntentCount > 0 {
-					h.advanceIssueToDone(ctx, issue, workspaceID)
+					h.advanceIssueToDone(ctx, issue, workspaceID, "github_pr_merged")
 				}
 			}
 		}
@@ -1404,14 +1410,19 @@ func (h *Handler) lookupIssueByIdentifier(ctx context.Context, workspaceID pgtyp
 	return issue, true
 }
 
-func (h *Handler) advanceIssueToDone(ctx context.Context, issue db.Issue, workspaceID string) {
+// advanceIssueToDone marks issue done because a linked PR/MR merged with
+// closing intent. source is the caller-specific `issue:updated` broadcast
+// tag (e.g. "github_pr_merged", "gitlab_mr_merged") — kept as a parameter
+// rather than hardcoded so this single implementation stays accurate for
+// every provider that reuses it.
+func (h *Handler) advanceIssueToDone(ctx context.Context, issue db.Issue, workspaceID, source string) {
 	updated, err := h.Queries.UpdateIssueStatus(ctx, db.UpdateIssueStatusParams{
 		ID:          issue.ID,
 		Status:      "done",
 		WorkspaceID: issue.WorkspaceID,
 	})
 	if err != nil {
-		slog.Warn("github: advance issue to done failed", "err", err)
+		slog.Warn("advance issue to done failed", "err", err, "source", source)
 		return
 	}
 
@@ -1431,7 +1442,7 @@ func (h *Handler) advanceIssueToDone(ctx context.Context, issue db.Issue, worksp
 		"prev_status":    issue.Status,
 		"creator_type":   issue.CreatorType,
 		"creator_id":     uuidToString(issue.CreatorID),
-		"source":         "github_pr_merged",
+		"source":         source,
 	})
 }
 

@@ -2,14 +2,15 @@
 
 import { LarkTab } from "./lark-tab";
 import { OctoTab } from "./octo-tab";
+import { GitLabTab } from "./gitlab-tab";
 import { useT } from "../../i18n";
 
 // Integrations is the umbrella tab for third-party platform connections.
 // GitHub has its own top-level tab (see github-tab.tsx); everything else
-// — Lark and Octo today, with Slack/Linear etc. to follow — lives in here
-// under its own section heading so additional integrations slot in without
-// changing the IA. IntegrationsTab is just the host; each integration owns
-// its own description and install flow.
+// — Lark, Octo, and GitLab today, with Slack/Linear etc. to follow — lives
+// in here under its own section heading so additional integrations slot in
+// without changing the IA. IntegrationsTab is just the host; each
+// integration owns its own description and install flow.
 export function IntegrationsTab() {
   const { t } = useT("settings");
   return (
@@ -22,6 +23,11 @@ export function IntegrationsTab() {
         <h2 className="text-sm font-semibold">{t(($) => $.octo.section_title)}</h2>
         <OctoTab />
       </section>
+      <section className="space-y-4">
+        <h2 className="text-sm font-semibold">{t(($) => $.gitlab.section_title)}</h2>
+        <GitLabTab />
+      </section>
     </div>
   );
 }
+

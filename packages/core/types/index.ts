@@ -119,6 +119,7 @@ export type {
   LarkInstallStatusResponse,
   RedeemLarkBindingTokenResponse,
 } from "./lark";
+export type { GitLabIntegrationResponse } from "./gitlab";
 export type {
   OctoInstallation,
   ListOctoInstallationsResponse,

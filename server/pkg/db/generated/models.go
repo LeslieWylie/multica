@@ -401,7 +401,7 @@ type GithubPendingInstallation struct {
 type GithubPullRequest struct {
 	ID              pgtype.UUID        `json:"id"`
 	WorkspaceID     pgtype.UUID        `json:"workspace_id"`
-	InstallationID  int64              `json:"installation_id"`
+	InstallationID  pgtype.Int8        `json:"installation_id"`
 	RepoOwner       string             `json:"repo_owner"`
 	RepoName        string             `json:"repo_name"`
 	PrNumber        int32              `json:"pr_number"`
@@ -422,6 +422,7 @@ type GithubPullRequest struct {
 	Additions       int32              `json:"additions"`
 	Deletions       int32              `json:"deletions"`
 	ChangedFiles    int32              `json:"changed_files"`
+	Provider        string             `json:"provider"`
 }
 
 type GithubPullRequestCheckSuite struct {
@@ -432,6 +433,15 @@ type GithubPullRequestCheckSuite struct {
 	Conclusion pgtype.Text        `json:"conclusion"`
 	Status     string             `json:"status"`
 	UpdatedAt  pgtype.Timestamptz `json:"updated_at"`
+}
+
+type GitlabIntegration struct {
+	ID           pgtype.UUID        `json:"id"`
+	WorkspaceID  pgtype.UUID        `json:"workspace_id"`
+	WebhookToken string             `json:"webhook_token"`
+	CreatedByID  pgtype.UUID        `json:"created_by_id"`
+	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt    pgtype.Timestamptz `json:"updated_at"`
 }
 
 type InboxItem struct {

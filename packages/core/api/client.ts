@@ -114,6 +114,7 @@ import type {
   GitHubPullRequest,
   ListGitHubInstallationsResponse,
   GitHubConnectResponse,
+  GitLabIntegrationResponse,
   ListLarkInstallationsResponse,
   BeginLarkInstallResponse,
   LarkInstallStatusResponse,
@@ -2353,6 +2354,15 @@ export class ApiClient {
 
   async listIssuePullRequests(issueId: string): Promise<{ pull_requests: GitHubPullRequest[] }> {
     return this.fetch(`/api/issues/${issueId}/pull-requests`);
+  }
+
+  // GitLab integration — per-workspace webhook token (see gitlab.ts types).
+  async getGitLabIntegration(workspaceId: string): Promise<GitLabIntegrationResponse> {
+    return this.fetch(`/api/workspaces/${workspaceId}/gitlab`);
+  }
+
+  async rotateGitLabIntegration(workspaceId: string): Promise<GitLabIntegrationResponse> {
+    return this.fetch(`/api/workspaces/${workspaceId}/gitlab/rotate`, { method: "POST" });
   }
 
   // Lark integration
