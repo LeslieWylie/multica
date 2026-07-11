@@ -3,9 +3,23 @@
 // project_id null = workspace-level ("org"), project_id set = project-level
 // ("repo"). See server migration 121 + handler/webhook_subscription.go.
 
-// v1 emits a single event type. Kept as a string union (open to extension) so
-// the UI can render new event types from the server without a code change.
-export type WebhookSubscriptionEvent = "issue.status_changed";
+// v1 emitted a single event type. Now three, kept as a string union (open to
+// extension) so the UI can render new event types from the server without a
+// code change.
+export type WebhookSubscriptionEvent =
+  | "issue.status_changed"
+  | "issue.assigned"
+  | "comment.created";
+
+// The full set the UI offers as checkboxes when creating/editing a
+// subscription. Kept as an ordered array (not derived from the union type)
+// so the checklist order is a deliberate UI decision, not incidental to
+// declaration order in the type above.
+export const WEBHOOK_SUBSCRIPTION_EVENTS: WebhookSubscriptionEvent[] = [
+  "issue.status_changed",
+  "issue.assigned",
+  "comment.created",
+];
 
 export interface WebhookSubscription {
   id: string;
