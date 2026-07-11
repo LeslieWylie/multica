@@ -355,6 +355,100 @@ func TestDispatchDeliversToMatchingSubscriptions(t *testing.T) {
 	}
 }
 
+// TestDispatchAssignedDeliversToMatchingSubscriptions mirrors
+// TestDispatchDeliversToMatchingSubscriptions for issue.assigned: workspace-
+// level + matching project-level subscriptions fire, a different project's
+// subscription does not.
+func TestDispatchAssignedDeliversToMatchingSubscriptions(t *testing.T) {
+	c := &collector{wg: &sync.WaitGroup{}}
+	srv := httptest.NewServer(http.HandlerFunc(c.handler))
+	defer srv.Close()
+
+	store := &fakeStore{subs: []db.WebhookSubscription{
+		sub(t, subID1, "", []string{EventIssueAssigned}, srv.URL),
+		sub(t, projA, projA, []string{EventIssueAssigned}, srv.URL),
+		sub(t, projB, projB, []string{EventIssueAssigned}, srv.URL),
+	}}
+	d := newTestDispatcher(t, store, &http.Client{Timeout: deliveryTimeout})
+
+	c.wg.Add(2) // expect exactly 2 successful deliveries
+	d.DispatchIssueAssigned(IssueAssigned{
+		WorkspaceID:          wsID,
+		ProjectID:            projA,
+		ActorType:            "member",
+		ActorID:              "actor-1",
+		Issue:                map[string]any{"id": "issue-1", "status": "todo"},
+		AssigneeType:         "agent",
+		AssigneeID:           "agent-1",
+		PreviousAssigneeType: "member",
+		PreviousAssigneeID:   "member-1",
+	})
+
+	waitTimeout(t, c.wg, 5*time.Second)
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.bodies) != 2 {
+		t.Fatalf("expected 2 deliveries, got %d", len(c.bodies))
+	}
+
+	var payload struct {
+		Event                string `json:"event"`
+		WorkspaceID          string `json:"workspace_id"`
+		PreviousAssigneeType string `json:"previous_assignee_type"`
+		PreviousAssigneeID   string `json:"previous_assignee_id"`
+		Actor                struct {
+			Type string `json:"type"`
+			ID   string `json:"id"`
+		} `json:"actor"`
+	}
+	if err := json.Unmarshal(c.bodies[0], &payload); err != nil {
+		t.Fatalf("unmarshal payload: %v", err)
+	}
+	if payload.Event != EventIssueAssigned {
+		t.Errorf("event = %q, want %q", payload.Event, EventIssueAssigned)
+	}
+	if payload.WorkspaceID != wsID {
+		t.Errorf("workspace_id = %q, want %q", payload.WorkspaceID, wsID)
+	}
+	if payload.PreviousAssigneeType != "member" || payload.PreviousAssigneeID != "member-1" {
+		t.Errorf("previous assignee = %q/%q, want member/member-1", payload.PreviousAssigneeType, payload.PreviousAssigneeID)
+	}
+	if payload.Actor.Type != "member" || payload.Actor.ID != "actor-1" {
+		t.Errorf("actor = %+v, want member/actor-1", payload.Actor)
+	}
+	if c.events[0] != EventIssueAssigned {
+		t.Errorf("X-Multica-Event = %q", c.events[0])
+	}
+	if !webhooksign.Verify("whsec_test", c.sigs[0], c.bodies[0]) {
+		t.Errorf("signature did not verify: %q", c.sigs[0])
+	}
+}
+
+// TestDispatchAssignedSkipsUnsubscribedEvent mirrors
+// TestDispatchSkipsUnsubscribedEvent for issue.assigned.
+func TestDispatchAssignedSkipsUnsubscribedEvent(t *testing.T) {
+	c := &collector{}
+	srv := httptest.NewServer(http.HandlerFunc(c.handler))
+	defer srv.Close()
+
+	store := &fakeStore{subs: []db.WebhookSubscription{
+		sub(t, subID1, "", []string{EventIssueStatusChanged}, srv.URL),
+	}}
+	d := newTestDispatcher(t, store, &http.Client{Timeout: deliveryTimeout})
+	d.DispatchIssueAssigned(IssueAssigned{
+		WorkspaceID: wsID,
+		Issue:       map[string]any{"id": "issue-1"},
+	})
+
+	time.Sleep(200 * time.Millisecond)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.bodies) != 0 {
+		t.Fatalf("expected 0 deliveries for unsubscribed event, got %d", len(c.bodies))
+	}
+}
+
 func TestDispatchSkipsUnsubscribedEvent(t *testing.T) {
 	c := &collector{}
 	srv := httptest.NewServer(http.HandlerFunc(c.handler))
