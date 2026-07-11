@@ -86,10 +86,24 @@ func TestValidateWebhookEvents(t *testing.T) {
 		t.Errorf("events = %v, want [%s]", got, outwebhook.EventIssueAssigned)
 	}
 
-	// Both known events together also pass.
+	// comment.created is accepted and round-trips.
+	b, err = validateWebhookEvents([]string{outwebhook.EventCommentCreated})
+	if err != nil {
+		t.Fatalf("comment.created rejected: %v", err)
+	}
+	got = nil
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(got) != 1 || got[0] != outwebhook.EventCommentCreated {
+		t.Errorf("events = %v, want [%s]", got, outwebhook.EventCommentCreated)
+	}
+
+	// All three known events together also pass.
 	b, err = validateWebhookEvents([]string{
 		outwebhook.EventIssueStatusChanged,
 		outwebhook.EventIssueAssigned,
+		outwebhook.EventCommentCreated,
 	})
 	if err != nil {
 		t.Fatalf("known events rejected: %v", err)
@@ -98,8 +112,8 @@ func TestValidateWebhookEvents(t *testing.T) {
 	if err := json.Unmarshal(b, &got); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if len(got) != 2 {
-		t.Errorf("events = %v, want 2 entries", got)
+	if len(got) != 3 {
+		t.Errorf("events = %v, want 3 entries", got)
 	}
 }
 

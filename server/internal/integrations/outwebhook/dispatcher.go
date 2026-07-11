@@ -44,12 +44,18 @@ const EventIssueStatusChanged = "issue.status_changed"
 // below).
 const EventIssueAssigned = "issue.assigned"
 
+// EventCommentCreated is the outbound wire event name for a new comment. Not
+// to be confused with protocol.EventCommentCreated ("comment:created"), the
+// internal event-bus event this dispatcher listens to — different
+// namespaces/packages that happen to share a similar name.
+const EventCommentCreated = "comment.created"
+
 // SupportedEventTypes is the single source of truth for the event types this
 // dispatcher can actually deliver. The handler allow-list (which events a
 // subscription may declare) is derived from it. Adding an entry here requires a
 // matching bus subscription in cmd/server/webhook_listeners.go — otherwise
 // subscriptions for the new type would be accepted by the API but never fire.
-var SupportedEventTypes = []string{EventIssueStatusChanged, EventIssueAssigned}
+var SupportedEventTypes = []string{EventIssueStatusChanged, EventIssueAssigned, EventCommentCreated}
 
 const (
 	deliveryTimeout = 30 * time.Second
@@ -151,19 +157,21 @@ type deliverJob struct {
 // pools — one stage for the per-event subscription lookup, one for delivery.
 //
 // Each event type gets its own statically-typed channel (events,
-// assignedEvents) rather than a single generic/interface{} channel. This
-// mirrors the original IssueStatusChanged plumbing as closely as possible per
-// event type — kept intentionally non-generic (no interface{}/any event
-// channel, no reflection-based fanout) so a reviewer can diff issue.assigned
-// against issue.status_changed side by side. A single dispatchWorker pool
-// drains both channels; the per-event-type dispatch logic (dispatch /
-// dispatchAssigned) still runs on that same bounded pool.
+// assignedEvents, commentEvents) rather than a single generic/interface{}
+// channel. This mirrors the original IssueStatusChanged plumbing as closely as
+// possible per event type — kept intentionally non-generic (no
+// interface{}/any event channel, no reflection-based fanout) so a reviewer can
+// diff issue.assigned / comment.created against issue.status_changed side by
+// side. A single dispatchWorker pool drains all three channels; the
+// per-event-type dispatch logic (dispatch / dispatchAssigned /
+// dispatchComment) still runs on that same bounded pool.
 type Dispatcher struct {
 	store          Store
 	client         *http.Client
 	appURL         string // absolute frontend app base URL (no trailing slash) for building issue_url; "" disables links
 	events         chan IssueStatusChanged
 	assignedEvents chan IssueAssigned
+	commentEvents  chan CommentCreated
 	jobs           chan deliverJob
 	retryBackoff   []time.Duration
 
@@ -200,6 +208,7 @@ func newWithClient(store Store, appURL string, client *http.Client) *Dispatcher 
 		appURL:         strings.TrimRight(strings.TrimSpace(appURL), "/"),
 		events:         make(chan IssueStatusChanged, eventQueueCapacity),
 		assignedEvents: make(chan IssueAssigned, eventQueueCapacity),
+		commentEvents:  make(chan CommentCreated, eventQueueCapacity),
 		jobs:           make(chan deliverJob, queueCapacity),
 		retryBackoff:   defaultRetryBackoff,
 		stopDispatch:   make(chan struct{}),
@@ -250,6 +259,8 @@ func (d *Dispatcher) dispatchWorker() {
 			d.dispatch(ev)
 		case ev := <-d.assignedEvents:
 			d.dispatchAssigned(ev)
+		case ev := <-d.commentEvents:
+			d.dispatchComment(ev)
 		case <-d.stopDispatch:
 			for {
 				select {
@@ -257,6 +268,8 @@ func (d *Dispatcher) dispatchWorker() {
 					d.dispatch(ev)
 				case ev := <-d.assignedEvents:
 					d.dispatchAssigned(ev)
+				case ev := <-d.commentEvents:
+					d.dispatchComment(ev)
 				default:
 					return
 				}
@@ -567,6 +580,112 @@ func (d *Dispatcher) dispatchAssigned(ev IssueAssigned) {
 	for _, s := range matched {
 		select {
 		case d.jobs <- deliverJob{sub: s, event: EventIssueAssigned, body: body}:
+		default:
+			slog.Warn("outwebhook: delivery queue full, dropping",
+				"subscription_id", util.UUIDToString(s.ID), "host", hostOf(s.Url))
+		}
+	}
+}
+
+// CommentCreated describes a single new comment. The listener builds it from
+// the comment:created event payload. Comment is the JSON-serializable comment
+// representation (handler.CommentResponse, or a map[string]any for
+// agent-authored comments) embedded verbatim in the outbound body — the
+// dispatcher does not depend on the handler package.
+type CommentCreated struct {
+	WorkspaceID string
+	ActorType   string
+	ActorID     string
+	Comment     any
+	// IssueID / IssueTitle / IssueStatus give receivers the issue context
+	// without requiring a follow-up API call. There is no issue identifier
+	// (e.g. "MUL-123") available on the comment:created payload today, so
+	// unlike IssueStatusChanged/IssueAssigned this event does not carry a
+	// clickable issue_url — IssueID is the reference receivers get instead.
+	IssueID     string
+	IssueTitle  string
+	IssueStatus string
+}
+
+// commentOutboundPayload is the versioned JSON body POSTed to subscribers for
+// comment.created.
+type commentOutboundPayload struct {
+	Event       string       `json:"event"`
+	WorkspaceID string       `json:"workspace_id"`
+	Actor       actorPayload `json:"actor"`
+	Comment     any          `json:"comment"`
+	IssueID     string       `json:"issue_id,omitempty"`
+	IssueTitle  string       `json:"issue_title,omitempty"`
+	IssueStatus string       `json:"issue_status,omitempty"`
+	DeliveredAt string       `json:"delivered_at"`
+}
+
+// DispatchCommentCreated hands the event to the bounded dispatch queue and
+// returns immediately. Same non-blocking / off-request-path contract as
+// DispatchIssueStatusChanged.
+func (d *Dispatcher) DispatchCommentCreated(ev CommentCreated) {
+	select {
+	case <-d.stopDispatch:
+		return
+	default:
+	}
+	select {
+	case d.commentEvents <- ev:
+	case <-d.stopDispatch:
+	default:
+		slog.Warn("outwebhook: comment event queue full, dropping", "workspace_id", ev.WorkspaceID)
+	}
+}
+
+// dispatchComment (off the request path, on a bounded dispatch worker) selects
+// matching subscriptions and enqueues their deliveries. comment.created has no
+// project scoping (comments don't carry a project_id independent of their
+// issue), so every enabled subscription that opted into the event fires
+// regardless of project — mirroring how project-level filtering only applies
+// to issue-shaped events in this dispatcher today.
+func (d *Dispatcher) dispatchComment(ev CommentCreated) {
+	wsUUID, err := util.ParseUUID(ev.WorkspaceID)
+	if err != nil {
+		slog.Warn("outwebhook: invalid workspace id", "workspace_id", ev.WorkspaceID, "error", err)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), listTimeout)
+	subs, err := d.store.ListEnabledWebhookSubscriptionsForDispatch(ctx, wsUUID)
+	cancel()
+	if err != nil {
+		slog.Error("outwebhook: failed to list subscriptions", "workspace_id", ev.WorkspaceID, "error", err)
+		return
+	}
+
+	matched := make([]db.WebhookSubscription, 0, len(subs))
+	for _, s := range subs {
+		if subscribedToEvent(s, EventCommentCreated) {
+			matched = append(matched, s)
+		}
+	}
+	if len(matched) == 0 {
+		return
+	}
+
+	body, err := json.Marshal(commentOutboundPayload{
+		Event:       EventCommentCreated,
+		WorkspaceID: ev.WorkspaceID,
+		Actor:       actorPayload{Type: ev.ActorType, ID: ev.ActorID},
+		Comment:     ev.Comment,
+		IssueID:     ev.IssueID,
+		IssueTitle:  ev.IssueTitle,
+		IssueStatus: ev.IssueStatus,
+		DeliveredAt: time.Now().UTC().Format(time.RFC3339),
+	})
+	if err != nil {
+		slog.Error("outwebhook: failed to marshal payload", "workspace_id", ev.WorkspaceID, "error", err)
+		return
+	}
+
+	for _, s := range matched {
+		select {
+		case d.jobs <- deliverJob{sub: s, event: EventCommentCreated, body: body}:
 		default:
 			slog.Warn("outwebhook: delivery queue full, dropping",
 				"subscription_id", util.UUIDToString(s.ID), "host", hostOf(s.Url))
