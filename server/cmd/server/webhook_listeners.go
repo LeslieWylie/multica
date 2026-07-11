@@ -10,13 +10,14 @@ import (
 )
 
 // registerWebhookListeners wires the outbound webhook dispatcher to the event
-// bus. v1 listens only for issue status changes and POSTs a signed payload to
-// every matching webhook_subscription (workspace-level or project-level).
+// bus. It listens for issue status changes and issue assignment changes,
+// POSTing a signed payload to every matching webhook_subscription
+// (workspace-level or project-level).
 //
 // This mirrors registerAutopilotListeners: it filters issue:updated events on
-// status_changed and reads the typed handler.IssueResponse out of the payload.
-// Delivery itself is async (the dispatcher detaches each POST), so this listener
-// never blocks the synchronous bus dispatch.
+// status_changed / assignee_changed and reads the typed handler.IssueResponse
+// out of the payload. Delivery itself is async (the dispatcher detaches each
+// POST), so this listener never blocks the synchronous bus dispatch.
 //
 // Scope of issue.status_changed (v1): it fires for status transitions published
 // as issue:updated with status_changed=true. That covers user/API/PR-merge
@@ -27,14 +28,16 @@ import (
 // status_changed. The issue payload arrives in one of two shapes — the typed
 // handler.IssueResponse (handler paths) or a map[string]any (service paths) —
 // and both are handled below.
+//
+// Scope of issue.assigned: it fires for assignment changes published as
+// issue:updated with assignee_changed=true (single update and batch update).
+// It does NOT fire for the github.go PR-merge path or task.go's
+// broadcastIssueUpdated, neither of which touches assignee — those never set
+// assignee_changed=true, so this handler is a no-op for them.
 func registerWebhookListeners(bus *events.Bus, d *outwebhook.Dispatcher) {
 	bus.Subscribe(protocol.EventIssueUpdated, func(e events.Event) {
 		payload, ok := e.Payload.(map[string]any)
 		if !ok {
-			return
-		}
-		statusChanged, _ := payload["status_changed"].(bool)
-		if !statusChanged {
 			return
 		}
 		fields, ok := webhookIssuePayload(payload["issue"])
@@ -42,19 +45,38 @@ func registerWebhookListeners(bus *events.Bus, d *outwebhook.Dispatcher) {
 			slog.Debug("webhook listener: unrecognized issue payload shape")
 			return
 		}
-		prevStatus, _ := payload["prev_status"].(string)
 
-		d.DispatchIssueStatusChanged(outwebhook.IssueStatusChanged{
-			WorkspaceID:    e.WorkspaceID,
-			ProjectID:      fields.projectID,
-			ActorType:      e.ActorType,
-			ActorID:        e.ActorID,
-			PreviousStatus: prevStatus,
-			Issue:          fields.issue,
-			Identifier:     fields.identifier,
-			AssigneeType:   fields.assigneeType,
-			AssigneeID:     fields.assigneeID,
-		})
+		if statusChanged, _ := payload["status_changed"].(bool); statusChanged {
+			prevStatus, _ := payload["prev_status"].(string)
+			d.DispatchIssueStatusChanged(outwebhook.IssueStatusChanged{
+				WorkspaceID:    e.WorkspaceID,
+				ProjectID:      fields.projectID,
+				ActorType:      e.ActorType,
+				ActorID:        e.ActorID,
+				PreviousStatus: prevStatus,
+				Issue:          fields.issue,
+				Identifier:     fields.identifier,
+				AssigneeType:   fields.assigneeType,
+				AssigneeID:     fields.assigneeID,
+			})
+		}
+
+		if assigneeChanged, _ := payload["assignee_changed"].(bool); assigneeChanged {
+			prevAssigneeType := stringFromMap(payload["prev_assignee_type"])
+			prevAssigneeID := stringFromMap(payload["prev_assignee_id"])
+			d.DispatchIssueAssigned(outwebhook.IssueAssigned{
+				WorkspaceID:          e.WorkspaceID,
+				ProjectID:            fields.projectID,
+				ActorType:            e.ActorType,
+				ActorID:              e.ActorID,
+				Issue:                fields.issue,
+				Identifier:           fields.identifier,
+				AssigneeType:         fields.assigneeType,
+				AssigneeID:           fields.assigneeID,
+				PreviousAssigneeType: prevAssigneeType,
+				PreviousAssigneeID:   prevAssigneeID,
+			})
+		}
 	})
 }
 

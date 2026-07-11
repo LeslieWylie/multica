@@ -101,3 +101,46 @@ func TestWebhookIssuePayload(t *testing.T) {
 		}
 	})
 }
+
+// TestAssigneeChangedPrevFieldsExtraction covers stringFromMap against the
+// exact prev_assignee_type/prev_assignee_id shapes issue.go's publish calls
+// emit: textToPtr/uuidToPtr produce *string, nil when the issue was
+// previously unassigned. registerWebhookListeners reads these two fields
+// straight off the issue:updated payload (not through webhookIssuePayload,
+// which only extracts the CURRENT assignee) to build IssueAssigned's
+// PreviousAssigneeType/PreviousAssigneeID.
+func TestAssigneeChangedPrevFieldsExtraction(t *testing.T) {
+	t.Run("previously assigned to a member", func(t *testing.T) {
+		payload := map[string]any{
+			"prev_assignee_type": strptr("member"),
+			"prev_assignee_id":   strptr("mem-1"),
+		}
+		if got := stringFromMap(payload["prev_assignee_type"]); got != "member" {
+			t.Errorf("prev_assignee_type = %q, want member", got)
+		}
+		if got := stringFromMap(payload["prev_assignee_id"]); got != "mem-1" {
+			t.Errorf("prev_assignee_id = %q, want mem-1", got)
+		}
+	})
+
+	t.Run("previously unassigned (nil *string)", func(t *testing.T) {
+		var nilType, nilID *string
+		payload := map[string]any{
+			"prev_assignee_type": nilType,
+			"prev_assignee_id":   nilID,
+		}
+		if got := stringFromMap(payload["prev_assignee_type"]); got != "" {
+			t.Errorf("prev_assignee_type = %q, want empty", got)
+		}
+		if got := stringFromMap(payload["prev_assignee_id"]); got != "" {
+			t.Errorf("prev_assignee_id = %q, want empty", got)
+		}
+	})
+
+	t.Run("field absent from payload entirely", func(t *testing.T) {
+		payload := map[string]any{}
+		if got := stringFromMap(payload["prev_assignee_type"]); got != "" {
+			t.Errorf("prev_assignee_type = %q, want empty", got)
+		}
+	})
+}

@@ -3062,12 +3062,14 @@ func (h *Handler) BatchUpdateIssues(w http.ResponseWriter, r *http.Request) {
 		projectChanged := req.Updates.ProjectID != nil && uuidToString(prevIssue.ProjectID) != uuidToString(issue.ProjectID)
 
 		h.publish(protocol.EventIssueUpdated, workspaceID, actorType, actorID, map[string]any{
-			"issue":            resp,
-			"assignee_changed": assigneeChanged,
-			"status_changed":   statusChanged,
-			"priority_changed": priorityChanged,
-			"prev_status":      prevIssue.Status,
-			"project_changed":  projectChanged,
+			"issue":              resp,
+			"assignee_changed":   assigneeChanged,
+			"status_changed":     statusChanged,
+			"priority_changed":   priorityChanged,
+			"prev_status":        prevIssue.Status,
+			"project_changed":    projectChanged,
+			"prev_assignee_type": textToPtr(prevIssue.AssigneeType),
+			"prev_assignee_id":   uuidToPtr(prevIssue.AssigneeID),
 		})
 
 		if assigneeChanged {
