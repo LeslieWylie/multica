@@ -279,6 +279,16 @@ WHERE atq.id = $1 AND a.workspace_id = $2;
 -- "any other quick-create-shaped task" (all four FKs NULL) for the same agent —
 -- otherwise a user mashing the create button could fire concurrent quick-creates
 -- whose completion lookup would race over "most recent issue by this agent".
+-- run_only autopilot tasks (issue_id AND chat_session_id both NULL, autopilot_run_id
+-- SET) matched none of the branches above until this one was added: they don't carry
+-- an issue/chat FK, and the quick-create branch explicitly requires autopilot_run_id
+-- IS NULL, so two run_only tasks for the same agent — e.g. the same webhook-triggered
+-- autopilot firing twice in quick succession — could both be claimed and executed
+-- concurrently with no serialization at all, bounded only by max_concurrent_tasks.
+-- Serializes on "any other run_only-shaped task for the same agent", not on matching
+-- autopilot_run_id/autopilot_id, so two DIFFERENT autopilots assigned to the same
+-- agent still serialize against each other too — the same coarse-grained tradeoff
+-- the quick-create branch already makes for its own shape.
 UPDATE agent_task_queue
 SET status = 'dispatched',
     dispatched_at = now(),
@@ -300,6 +310,14 @@ WHERE id = (
                 AND active.issue_id IS NULL
                 AND active.chat_session_id IS NULL
                 AND active.autopilot_run_id IS NULL
+              )
+              OR (
+                atq.issue_id IS NULL
+                AND atq.chat_session_id IS NULL
+                AND atq.autopilot_run_id IS NOT NULL
+                AND active.issue_id IS NULL
+                AND active.chat_session_id IS NULL
+                AND active.autopilot_run_id IS NOT NULL
               )
             )
       )
