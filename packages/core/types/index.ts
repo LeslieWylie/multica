@@ -159,6 +159,7 @@ export type {
   OutboundWebhookDeliveryStatus,
   ListOutboundWebhookDeliveriesResponse,
 } from "./webhook-subscription";
+export { WEBHOOK_SUBSCRIPTION_EVENTS } from "./webhook-subscription";
 export type {
   Squad,
   SquadMember,
