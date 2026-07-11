@@ -10,8 +10,8 @@ import (
 )
 
 // registerWebhookListeners wires the outbound webhook dispatcher to the event
-// bus. It listens for issue status changes and issue assignment changes,
-// POSTing a signed payload to every matching webhook_subscription
+// bus. It listens for issue status changes, issue assignment changes, and new
+// comments, POSTing a signed payload to every matching webhook_subscription
 // (workspace-level or project-level).
 //
 // This mirrors registerAutopilotListeners: it filters issue:updated events on
@@ -34,6 +34,14 @@ import (
 // It does NOT fire for the github.go PR-merge path or task.go's
 // broadcastIssueUpdated, neither of which touches assignee — those never set
 // assignee_changed=true, so this handler is a no-op for them.
+//
+// Scope of comment.created: it fires for every comment:created event
+// (human CreateComment, agent-authored comments from task.go, and the
+// MUL-2538 system child-done comment) — there is no filtering on author_type
+// here; a subscription that wants to exclude system comments must filter on
+// the receiving end. The comment payload arrives in one of two shapes — the
+// typed handler.CommentResponse (handler paths) or a map[string]any
+// (task.go's agent-comment path) — both handled by webhookCommentPayload.
 func registerWebhookListeners(bus *events.Bus, d *outwebhook.Dispatcher) {
 	bus.Subscribe(protocol.EventIssueUpdated, func(e events.Event) {
 		payload, ok := e.Payload.(map[string]any)
@@ -77,6 +85,30 @@ func registerWebhookListeners(bus *events.Bus, d *outwebhook.Dispatcher) {
 				PreviousAssigneeID:   prevAssigneeID,
 			})
 		}
+	})
+
+	bus.Subscribe(protocol.EventCommentCreated, func(e events.Event) {
+		payload, ok := e.Payload.(map[string]any)
+		if !ok {
+			return
+		}
+		fields, ok := webhookCommentPayload(payload["comment"])
+		if !ok {
+			slog.Debug("webhook listener: unrecognized comment payload shape")
+			return
+		}
+		issueTitle, _ := payload["issue_title"].(string)
+		issueStatus, _ := payload["issue_status"].(string)
+
+		d.DispatchCommentCreated(outwebhook.CommentCreated{
+			WorkspaceID: e.WorkspaceID,
+			ActorType:   e.ActorType,
+			ActorID:     e.ActorID,
+			Comment:     fields.comment,
+			IssueID:     fields.issueID,
+			IssueTitle:  issueTitle,
+			IssueStatus: issueStatus,
+		})
 	})
 }
 
@@ -137,4 +169,30 @@ func stringFromMap(raw any) string {
 		}
 	}
 	return ""
+}
+
+// webhookCommentFields is everything the listener extracts from a
+// comment:created payload's "comment" field: the raw comment body to embed
+// verbatim, and the issue id it belongs to (there is no clickable issue_url
+// for comments — see CommentCreated's doc comment).
+type webhookCommentFields struct {
+	comment any
+	issueID string
+}
+
+// webhookCommentPayload extracts webhookCommentFields from either shape of
+// the comment:created payload's "comment" field: the typed
+// handler.CommentResponse (human CreateComment / system child-done comment,
+// both published via handler.publish) or the map[string]any emitted by
+// task.go's agent-comment path. Mirrors webhookIssuePayload's dual-shape
+// handling. Returns ok=false when neither shape is present.
+func webhookCommentPayload(raw any) (webhookCommentFields, bool) {
+	switch v := raw.(type) {
+	case handler.CommentResponse:
+		return webhookCommentFields{comment: v, issueID: v.IssueID}, true
+	case map[string]any:
+		return webhookCommentFields{comment: v, issueID: stringFromMap(v["issue_id"])}, true
+	default:
+		return webhookCommentFields{}, false
+	}
 }
