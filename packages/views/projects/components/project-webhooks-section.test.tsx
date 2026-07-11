@@ -67,6 +67,38 @@ vi.mock("sonner", () => ({
   toast: { success: vi.fn(), error: vi.fn() },
 }));
 
+// The real dropdown-menu is a Base UI popup (Portal + pointer-based open),
+// which jsdom + userEvent.click doesn't reliably drive. Every other test
+// in this repo that touches DropdownMenu mocks the module the same way —
+// see projects-page.test.tsx / create-project.test.tsx / create-issue.test.tsx
+// — rendering content unconditionally and wiring onCheckedChange straight
+// to onClick, so a plain click exercises the same callback the real
+// component would fire.
+vi.mock("@multica/ui/components/ui/dropdown-menu", () => ({
+  DropdownMenu: ({ children }: { children: React.ReactNode }) => (
+    <>{children}</>
+  ),
+  DropdownMenuTrigger: ({ render }: { render: React.ReactNode }) => (
+    <>{render}</>
+  ),
+  DropdownMenuContent: ({ children }: { children: React.ReactNode }) => (
+    <div>{children}</div>
+  ),
+  DropdownMenuCheckboxItem: ({
+    children,
+    onCheckedChange,
+    checked,
+  }: {
+    children: React.ReactNode;
+    onCheckedChange?: (checked: boolean) => void;
+    checked?: boolean;
+  }) => (
+    <button type="button" onClick={() => onCheckedChange?.(!checked)}>
+      {children}
+    </button>
+  ),
+}));
+
 import { ProjectWebhooksSection } from "./project-webhooks-section";
 
 const TEST_RESOURCES = {
@@ -133,7 +165,7 @@ describe("ProjectWebhooksSection", () => {
     expect(optionsProjectId.current).toBe(PROJECT_ID);
   });
 
-  it("creates a project-scoped subscription with project_id", async () => {
+  it("creates a project-scoped subscription with project_id and every event by default", async () => {
     mockCreate.mockResolvedValue(makeSub({ secret: "whsec_revealed" }));
     render(<ProjectWebhooksSection projectId={PROJECT_ID} />, {
       wrapper: I18nWrapper,
@@ -151,9 +183,36 @@ describe("ProjectWebhooksSection", () => {
       expect(mockCreate).toHaveBeenCalledWith({
         url: "https://p.example.com/hook",
         project_id: PROJECT_ID,
+        events: ["issue.status_changed", "issue.assigned", "comment.created"],
       }),
     );
     expect(await screen.findByText("whsec_revealed")).toBeTruthy();
+  });
+
+  it("narrows events via the compact events dropdown before creating", async () => {
+    mockCreate.mockResolvedValue(makeSub({ secret: "whsec_revealed" }));
+    render(<ProjectWebhooksSection projectId={PROJECT_ID} />, {
+      wrapper: I18nWrapper,
+    });
+    await userEvent.click(screen.getByRole("button", { name: /Webhooks/i }));
+    await userEvent.click(screen.getByRole("button", { name: /^Add$/i }));
+    await userEvent.type(
+      screen.getByPlaceholderText(/example\.com/i),
+      "https://p.example.com/hook",
+    );
+
+    // Content renders unconditionally under the dropdown-menu mock (see the
+    // module mock's comment) — no "open" step needed. Uncheck comment.created.
+    await userEvent.click(screen.getByText("comment.created"));
+    await userEvent.click(screen.getByRole("button", { name: /^Add$/i }));
+
+    await waitFor(() =>
+      expect(mockCreate).toHaveBeenCalledWith({
+        url: "https://p.example.com/hook",
+        project_id: PROJECT_ID,
+        events: ["issue.status_changed", "issue.assigned"],
+      }),
+    );
   });
 
   it("lists existing project subscriptions when expanded", async () => {

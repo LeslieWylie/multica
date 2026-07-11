@@ -108,7 +108,7 @@ describe("WebhooksSection", () => {
     expect(screen.getByText("https://hooks.acme.dev/in")).toBeTruthy();
   });
 
-  it("creates a subscription from the add form", async () => {
+  it("creates a subscription with every event checked by default", async () => {
     mockCreate.mockResolvedValue(makeSub({ secret: "whsec_revealed" }));
     render(<WebhooksSection />, { wrapper: I18nWrapper });
 
@@ -120,10 +120,70 @@ describe("WebhooksSection", () => {
       expect(mockCreate).toHaveBeenCalledWith({
         url: "https://new.example.com/hook",
         project_id: null,
+        events: ["issue.status_changed", "issue.assigned", "comment.created"],
       }),
     );
     // Secret-once dialog surfaces the revealed secret.
     expect(await screen.findByText("whsec_revealed")).toBeTruthy();
+  });
+
+  it("unchecking an event narrows what the create request subscribes to", async () => {
+    mockCreate.mockResolvedValue(makeSub({ secret: "whsec_revealed" }));
+    render(<WebhooksSection />, { wrapper: I18nWrapper });
+
+    await userEvent.type(
+      screen.getByPlaceholderText(/example\.com/i),
+      "https://new.example.com/hook",
+    );
+    // Checkboxes render in WEBHOOK_SUBSCRIPTION_EVENTS order: status_changed,
+    // assigned, comment.created. Uncheck the third to leave the other two.
+    const checkboxes = screen.getAllByRole("checkbox");
+    await userEvent.click(checkboxes[2]!);
+    await userEvent.click(screen.getByRole("button", { name: /^Add$/i }));
+
+    await waitFor(() =>
+      expect(mockCreate).toHaveBeenCalledWith({
+        url: "https://new.example.com/hook",
+        project_id: null,
+        events: ["issue.status_changed", "issue.assigned"],
+      }),
+    );
+  });
+
+  it("disables Add once every event is unchecked", async () => {
+    render(<WebhooksSection />, { wrapper: I18nWrapper });
+    await userEvent.type(
+      screen.getByPlaceholderText(/example\.com/i),
+      "https://new.example.com/hook",
+    );
+    for (const checkbox of screen.getAllByRole("checkbox")) {
+      await userEvent.click(checkbox);
+    }
+    expect(screen.getByRole("button", { name: /^Add$/i })).toBeDisabled();
+  });
+
+  it("edits an existing subscription's events", async () => {
+    subsRef.current = [makeSub({ events: ["issue.status_changed"] })];
+    mockUpdate.mockResolvedValue(
+      makeSub({ events: ["issue.status_changed", "issue.assigned"] }),
+    );
+    render(<WebhooksSection />, { wrapper: I18nWrapper });
+
+    await userEvent.click(
+      screen.getByRole("button", { name: /^Edit events$/i }),
+    );
+    // The row's checklist renders after the create form's, so its checkboxes
+    // are the second group of 3 in document order. Index 1 within that group
+    // is issue.assigned (WEBHOOK_SUBSCRIPTION_EVENTS order).
+    const checkboxes = screen.getAllByRole("checkbox");
+    await userEvent.click(checkboxes[3 + 1]!);
+
+    await waitFor(() =>
+      expect(mockUpdate).toHaveBeenCalledWith({
+        id: "sub-1",
+        events: ["issue.status_changed", "issue.assigned"],
+      }),
+    );
   });
 
   it("hides management UI for non-admin members", () => {
