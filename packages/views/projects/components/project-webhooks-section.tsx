@@ -9,10 +9,63 @@ import {
   TooltipTrigger,
   TooltipContent,
 } from "@multica/ui/components/ui/tooltip";
+import {
+  DropdownMenu,
+  DropdownMenuTrigger,
+  DropdownMenuContent,
+  DropdownMenuCheckboxItem,
+} from "@multica/ui/components/ui/dropdown-menu";
+import type { WebhookSubscriptionEvent } from "@multica/core/types";
+import { WEBHOOK_SUBSCRIPTION_EVENTS } from "@multica/core/types";
 import { useT } from "../../i18n";
 import { useWebhookSection } from "../../settings/components/use-webhook-section";
 import { WebhookDialogs } from "../../settings/components/webhook-dialogs";
 import { WebhookSubscriptionDeliveriesDialog } from "../../webhooks/components/webhook-subscription-deliveries-dialog";
+
+// EventsMenu is the compact GitHub-style checklist for picking which events a
+// subscription receives. Shared by the create-form trigger (below the URL
+// input) and each existing row's edit trigger — both just pass a different
+// (selected, onToggle) pair, so this owns only the popup + checkbox rows.
+function EventsMenu({
+  selected,
+  onToggle,
+  children,
+}: {
+  // string[], not WebhookSubscriptionEvent[]: an existing subscription's
+  // `events` comes straight off the API response, which is typed as a plain
+  // string[] (server is the source of truth for what's valid; the client
+  // union is a UI convenience, not a runtime guarantee). `.includes(event)`
+  // below works fine against the wider type.
+  selected: string[];
+  onToggle: (event: WebhookSubscriptionEvent, checked: boolean) => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger render={children as React.ReactElement} />
+      <DropdownMenuContent align="start" className="w-auto min-w-40">
+        {WEBHOOK_SUBSCRIPTION_EVENTS.map((event) => (
+          <DropdownMenuCheckboxItem
+            key={event}
+            checked={selected.includes(event)}
+            // Disable unchecking the last remaining event on an existing
+            // subscription — the server rejects an empty list, and the hook's
+            // handleToggleEvent already no-ops on it, but disabling here
+            // gives a visible reason instead of a silent no-op. The create
+            // form's own list is never disabled this way since it's fine
+            // (if unusual) to momentarily have zero checked before Add is
+            // re-enabled by checking one back.
+            disabled={selected.length === 1 && selected.includes(event)}
+            onCheckedChange={(checked) => onToggle(event, checked === true)}
+            className="text-xs"
+          >
+            <code>{event}</code>
+          </DropdownMenuCheckboxItem>
+        ))}
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}
 
 // Project-level outbound webhooks, rendered as a collapsible section in the
 // project detail right panel (directly below Resources). Shares all logic with
@@ -75,6 +128,20 @@ export function ProjectWebhooksSection({ projectId }: { projectId: string }) {
                     />
                     <TooltipContent side="top">{sub.url}</TooltipContent>
                   </Tooltip>
+                  <EventsMenu
+                    selected={sub.events}
+                    onToggle={(event, checked) =>
+                      wh.handleToggleEvent(sub, event, checked)
+                    }
+                  >
+                    <button
+                      type="button"
+                      className="rounded-sm px-1 text-[10px] text-muted-foreground hover:bg-accent hover:text-foreground"
+                      title={t(($) => $.webhooks.edit_events_button)}
+                    >
+                      {sub.events.length}
+                    </button>
+                  </EventsMenu>
                   <Switch
                     checked={sub.enabled}
                     onCheckedChange={(v) => wh.handleToggle(sub, v)}
@@ -104,34 +171,55 @@ export function ProjectWebhooksSection({ projectId }: { projectId: string }) {
           )}
 
           {adding ? (
-            <div className="flex items-center gap-1.5">
-              <input
-                autoFocus
-                type="url"
-                value={wh.newUrl}
-                onChange={(e) => wh.setNewUrl(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") {
-                    e.preventDefault();
-                    void handleCreate();
-                  } else if (e.key === "Escape") {
-                    e.preventDefault();
-                    setAdding(false);
-                    wh.setNewUrl("");
+            <div className="space-y-1.5">
+              <div className="flex items-center gap-1.5">
+                <input
+                  autoFocus
+                  type="url"
+                  value={wh.newUrl}
+                  onChange={(e) => wh.setNewUrl(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      void handleCreate();
+                    } else if (e.key === "Escape") {
+                      e.preventDefault();
+                      setAdding(false);
+                      wh.setNewUrl("");
+                    }
+                  }}
+                  placeholder="https://example.com/webhooks/multica"
+                  className="flex-1 min-w-0 rounded-sm border bg-transparent px-2 py-1 text-xs outline-none placeholder:text-muted-foreground focus-visible:ring-1 focus-visible:ring-ring"
+                />
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  className="h-6 px-2 text-xs"
+                  disabled={
+                    !wh.newUrl.trim() ||
+                    wh.newEvents.length === 0 ||
+                    wh.isCreating
                   }
-                }}
-                placeholder="https://example.com/webhooks/multica"
-                className="flex-1 min-w-0 rounded-sm border bg-transparent px-2 py-1 text-xs outline-none placeholder:text-muted-foreground focus-visible:ring-1 focus-visible:ring-ring"
-              />
-              <Button
-                size="sm"
-                variant="ghost"
-                className="h-6 px-2 text-xs"
-                disabled={!wh.newUrl.trim() || wh.isCreating}
-                onClick={() => void handleCreate()}
+                  onClick={() => void handleCreate()}
+                >
+                  {t(($) => $.webhooks.add_button)}
+                </Button>
+              </div>
+              <EventsMenu
+                selected={wh.newEvents}
+                onToggle={(event, checked) =>
+                  wh.toggleNewEvent(event, checked)
+                }
               >
-                {t(($) => $.webhooks.add_button)}
-              </Button>
+                <button
+                  type="button"
+                  className="rounded-sm border px-2 py-0.5 text-[10px] text-muted-foreground hover:bg-accent hover:text-foreground"
+                >
+                  {t(($) => $.webhooks.events_selected_count, {
+                    count: wh.newEvents.length,
+                  })}
+                </button>
+              </EventsMenu>
             </div>
           ) : (
             <Button
@@ -146,7 +234,7 @@ export function ProjectWebhooksSection({ projectId }: { projectId: string }) {
           )}
 
           <p className="px-2 text-[10px] text-muted-foreground">
-            {t(($) => $.webhooks.event_hint)}
+            {t(($) => $.webhooks.signature_hint)}
           </p>
         </div>
       )}
