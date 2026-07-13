@@ -39,7 +39,10 @@ import (
 // (human CreateComment, agent-authored comments from task.go, and the
 // MUL-2538 system child-done comment) — there is no filtering on author_type
 // here; a subscription that wants to exclude system comments must filter on
-// the receiving end. The comment payload arrives in one of two shapes — the
+// the receiving end. Project-level subscriptions only receive comments on
+// issues in their own project (issue_project_id, resolved by each publish
+// site from the issue's project_id, same as issue.status_changed/
+// issue.assigned). The comment payload arrives in one of two shapes — the
 // typed handler.CommentResponse (handler paths) or a map[string]any
 // (task.go's agent-comment path) — both handled by webhookCommentPayload.
 func registerWebhookListeners(bus *events.Bus, d *outwebhook.Dispatcher) {
@@ -99,9 +102,11 @@ func registerWebhookListeners(bus *events.Bus, d *outwebhook.Dispatcher) {
 		}
 		issueTitle, _ := payload["issue_title"].(string)
 		issueStatus, _ := payload["issue_status"].(string)
+		issueProjectID := stringFromMap(payload["issue_project_id"])
 
 		d.DispatchCommentCreated(outwebhook.CommentCreated{
 			WorkspaceID: e.WorkspaceID,
+			ProjectID:   issueProjectID,
 			ActorType:   e.ActorType,
 			ActorID:     e.ActorID,
 			Comment:     fields.comment,
