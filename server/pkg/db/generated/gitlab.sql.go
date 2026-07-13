@@ -14,36 +14,59 @@ import (
 const createGitLabIntegration = `-- name: CreateGitLabIntegration :one
 
 
-INSERT INTO gitlab_integration (workspace_id, webhook_token, created_by_id)
-VALUES ($1, $2, $3)
-ON CONFLICT (workspace_id) DO UPDATE SET
-    webhook_token = EXCLUDED.webhook_token,
+INSERT INTO gitlab_integration (
+    workspace_id, gitlab_host, gitlab_project_id, gitlab_project_path,
+    webhook_secret, created_by_id
+) VALUES (
+    $1, $2, $3, $4, $5, $6
+)
+ON CONFLICT (workspace_id, gitlab_host, gitlab_project_id) DO UPDATE SET
+    gitlab_project_path = EXCLUDED.gitlab_project_path,
+    webhook_secret = EXCLUDED.webhook_secret,
     updated_at = now()
-RETURNING id, workspace_id, webhook_token, created_by_id, created_at, updated_at
+RETURNING id, workspace_id, gitlab_host, gitlab_project_id, gitlab_project_path, webhook_secret, created_by_id, created_at, updated_at
 `
 
 type CreateGitLabIntegrationParams struct {
-	WorkspaceID  pgtype.UUID `json:"workspace_id"`
-	WebhookToken string      `json:"webhook_token"`
-	CreatedByID  pgtype.UUID `json:"created_by_id"`
+	WorkspaceID       pgtype.UUID `json:"workspace_id"`
+	GitlabHost        string      `json:"gitlab_host"`
+	GitlabProjectID   int64       `json:"gitlab_project_id"`
+	GitlabProjectPath string      `json:"gitlab_project_path"`
+	WebhookSecret     string      `json:"webhook_secret"`
+	CreatedByID       pgtype.UUID `json:"created_by_id"`
 }
 
 // GitLab merge-request integration: mirrors GitHub's pull-request sync
 // (see github.sql UpsertGitHubPullRequest / ListPullRequestsByIssue) using
-// the same generalized github_pull_request table (migration 128). Kept in a
+// the same generalized github_pull_request table (migration 155). Kept in a
 // separate file — not appended to github.sql — because the two providers'
 // upsert/lookup queries never share a WHERE clause and this keeps each
 // provider's webhook-ingestion queries independently reviewable.
 // =====================
-// GitLab integration (per-workspace webhook token)
+// GitLab integration (per-project webhook registration — see migration 155
+// for why this is per-project rather than a single workspace-wide token)
 // =====================
+// ON CONFLICT re-registering the same (workspace, host, project) rotates its
+// secret rather than erroring — matches CreateWebhookSubscription's "PATCH
+// via re-create" ergonomics for a credential the operator may need to
+// reissue after a leak, without a separate rotate endpoint.
 func (q *Queries) CreateGitLabIntegration(ctx context.Context, arg CreateGitLabIntegrationParams) (GitlabIntegration, error) {
-	row := q.db.QueryRow(ctx, createGitLabIntegration, arg.WorkspaceID, arg.WebhookToken, arg.CreatedByID)
+	row := q.db.QueryRow(ctx, createGitLabIntegration,
+		arg.WorkspaceID,
+		arg.GitlabHost,
+		arg.GitlabProjectID,
+		arg.GitlabProjectPath,
+		arg.WebhookSecret,
+		arg.CreatedByID,
+	)
 	var i GitlabIntegration
 	err := row.Scan(
 		&i.ID,
 		&i.WorkspaceID,
-		&i.WebhookToken,
+		&i.GitlabHost,
+		&i.GitlabProjectID,
+		&i.GitlabProjectPath,
+		&i.WebhookSecret,
 		&i.CreatedByID,
 		&i.CreatedAt,
 		&i.UpdatedAt,
@@ -51,17 +74,47 @@ func (q *Queries) CreateGitLabIntegration(ctx context.Context, arg CreateGitLabI
 	return i, err
 }
 
-const getGitLabIntegrationByToken = `-- name: GetGitLabIntegrationByToken :one
-SELECT id, workspace_id, webhook_token, created_by_id, created_at, updated_at FROM gitlab_integration WHERE webhook_token = $1
+const deleteGitLabIntegration = `-- name: DeleteGitLabIntegration :one
+DELETE FROM gitlab_integration WHERE id = $1 AND workspace_id = $2
+RETURNING id, workspace_id
 `
 
-func (q *Queries) GetGitLabIntegrationByToken(ctx context.Context, webhookToken string) (GitlabIntegration, error) {
-	row := q.db.QueryRow(ctx, getGitLabIntegrationByToken, webhookToken)
+type DeleteGitLabIntegrationParams struct {
+	ID          pgtype.UUID `json:"id"`
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+}
+
+type DeleteGitLabIntegrationRow struct {
+	ID          pgtype.UUID `json:"id"`
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+}
+
+// Scoped by (id, workspace_id) like DeleteGitHubInstallation, so a caller
+// can never delete another workspace's integration by guessing an id.
+func (q *Queries) DeleteGitLabIntegration(ctx context.Context, arg DeleteGitLabIntegrationParams) (DeleteGitLabIntegrationRow, error) {
+	row := q.db.QueryRow(ctx, deleteGitLabIntegration, arg.ID, arg.WorkspaceID)
+	var i DeleteGitLabIntegrationRow
+	err := row.Scan(&i.ID, &i.WorkspaceID)
+	return i, err
+}
+
+const getGitLabIntegrationByID = `-- name: GetGitLabIntegrationByID :one
+SELECT id, workspace_id, gitlab_host, gitlab_project_id, gitlab_project_path, webhook_secret, created_by_id, created_at, updated_at FROM gitlab_integration WHERE id = $1
+`
+
+// The webhook route's lookup — keyed by the URL's routing id, which is NOT
+// itself a secret (see migration 155 doc comment); the actual credential is
+// webhook_secret, verified separately against X-Gitlab-Token.
+func (q *Queries) GetGitLabIntegrationByID(ctx context.Context, id pgtype.UUID) (GitlabIntegration, error) {
+	row := q.db.QueryRow(ctx, getGitLabIntegrationByID, id)
 	var i GitlabIntegration
 	err := row.Scan(
 		&i.ID,
 		&i.WorkspaceID,
-		&i.WebhookToken,
+		&i.GitlabHost,
+		&i.GitlabProjectID,
+		&i.GitlabProjectPath,
+		&i.WebhookSecret,
 		&i.CreatedByID,
 		&i.CreatedAt,
 		&i.UpdatedAt,
@@ -69,38 +122,54 @@ func (q *Queries) GetGitLabIntegrationByToken(ctx context.Context, webhookToken 
 	return i, err
 }
 
-const getGitLabIntegrationByWorkspace = `-- name: GetGitLabIntegrationByWorkspace :one
-SELECT id, workspace_id, webhook_token, created_by_id, created_at, updated_at FROM gitlab_integration WHERE workspace_id = $1
+const listGitLabIntegrationsByWorkspace = `-- name: ListGitLabIntegrationsByWorkspace :many
+SELECT id, workspace_id, gitlab_host, gitlab_project_id, gitlab_project_path, webhook_secret, created_by_id, created_at, updated_at FROM gitlab_integration WHERE workspace_id = $1 ORDER BY created_at ASC
 `
 
-func (q *Queries) GetGitLabIntegrationByWorkspace(ctx context.Context, workspaceID pgtype.UUID) (GitlabIntegration, error) {
-	row := q.db.QueryRow(ctx, getGitLabIntegrationByWorkspace, workspaceID)
-	var i GitlabIntegration
-	err := row.Scan(
-		&i.ID,
-		&i.WorkspaceID,
-		&i.WebhookToken,
-		&i.CreatedByID,
-		&i.CreatedAt,
-		&i.UpdatedAt,
-	)
-	return i, err
+func (q *Queries) ListGitLabIntegrationsByWorkspace(ctx context.Context, workspaceID pgtype.UUID) ([]GitlabIntegration, error) {
+	rows, err := q.db.Query(ctx, listGitLabIntegrationsByWorkspace, workspaceID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []GitlabIntegration{}
+	for rows.Next() {
+		var i GitlabIntegration
+		if err := rows.Scan(
+			&i.ID,
+			&i.WorkspaceID,
+			&i.GitlabHost,
+			&i.GitlabProjectID,
+			&i.GitlabProjectPath,
+			&i.WebhookSecret,
+			&i.CreatedByID,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const upsertGitLabMergeRequest = `-- name: UpsertGitLabMergeRequest :one
 
 INSERT INTO github_pull_request (
-    workspace_id, installation_id, provider, repo_owner, repo_name, pr_number,
+    workspace_id, installation_id, provider, provider_host, repo_owner, repo_name, pr_number,
     title, state, html_url, branch, author_login, author_avatar_url,
     merged_at, closed_at, pr_created_at, pr_updated_at,
     head_sha, mergeable_state
 ) VALUES (
-    $1, NULL, 'gitlab', $2, $3, $4,
-    $5, $6, $7, $11, $12, $13,
-    $14, $15, $8, $9,
-    $10, $16
+    $1, NULL, 'gitlab', $2, $3, $4, $5,
+    $6, $7, $8, $12, $13, $14,
+    $15, $16, $9, $10,
+    $11, $17
 )
-ON CONFLICT (workspace_id, repo_owner, repo_name, pr_number) DO UPDATE SET
+ON CONFLICT (workspace_id, provider, provider_host, repo_owner, repo_name, pr_number) DO UPDATE SET
     title = EXCLUDED.title,
     state = EXCLUDED.state,
     html_url = EXCLUDED.html_url,
@@ -113,11 +182,12 @@ ON CONFLICT (workspace_id, repo_owner, repo_name, pr_number) DO UPDATE SET
     head_sha = EXCLUDED.head_sha,
     mergeable_state = EXCLUDED.mergeable_state,
     updated_at = now()
-RETURNING id, workspace_id, installation_id, repo_owner, repo_name, pr_number, title, state, html_url, branch, author_login, author_avatar_url, merged_at, closed_at, pr_created_at, pr_updated_at, created_at, updated_at, head_sha, mergeable_state, additions, deletions, changed_files, provider
+RETURNING id, workspace_id, installation_id, repo_owner, repo_name, pr_number, title, state, html_url, branch, author_login, author_avatar_url, merged_at, closed_at, pr_created_at, pr_updated_at, created_at, updated_at, head_sha, mergeable_state, additions, deletions, changed_files, provider, provider_host
 `
 
 type UpsertGitLabMergeRequestParams struct {
 	WorkspaceID     pgtype.UUID        `json:"workspace_id"`
+	ProviderHost    string             `json:"provider_host"`
 	RepoOwner       string             `json:"repo_owner"`
 	RepoName        string             `json:"repo_name"`
 	PrNumber        int32              `json:"pr_number"`
@@ -139,15 +209,19 @@ type UpsertGitLabMergeRequestParams struct {
 // GitLab merge request mirror (github_pull_request, provider='gitlab')
 // =====================
 // installation_id is always NULL for GitLab rows (no installation concept —
-// see migration 128). mergeable_state has simpler two-state semantics than
-// GitHub's (no separate "clear on state-changing action" pass): GitLab's
-// merge_status/detailed_merge_status is reported fresh on every webhook
-// delivery, so the incoming value (possibly NULL when GitLab hasn't
-// computed it yet) always overwrites — no "preserve existing column when
-// absent" case like GitHub's metadata-only events.
+// see migration 155). provider_host carries the registered integration's
+// gitlab_host, widening the identity key alongside provider so two GitLab
+// instances (or GitHub vs GitLab) sharing a repo_owner/repo_name string in
+// one workspace can't overwrite each other. mergeable_state has simpler
+// two-state semantics than GitHub's (no separate "clear on state-changing
+// action" pass): GitLab's merge_status/detailed_merge_status is reported
+// fresh on every webhook delivery, so the incoming value (possibly NULL when
+// GitLab hasn't computed it yet) always overwrites — no "preserve existing
+// column when absent" case like GitHub's metadata-only events.
 func (q *Queries) UpsertGitLabMergeRequest(ctx context.Context, arg UpsertGitLabMergeRequestParams) (GithubPullRequest, error) {
 	row := q.db.QueryRow(ctx, upsertGitLabMergeRequest,
 		arg.WorkspaceID,
+		arg.ProviderHost,
 		arg.RepoOwner,
 		arg.RepoName,
 		arg.PrNumber,
@@ -190,6 +264,7 @@ func (q *Queries) UpsertGitLabMergeRequest(ctx context.Context, arg UpsertGitLab
 		&i.Deletions,
 		&i.ChangedFiles,
 		&i.Provider,
+		&i.ProviderHost,
 	)
 	return i, err
 }

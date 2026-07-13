@@ -16,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/middleware"
+	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/protocol"
 )
@@ -25,75 +26,97 @@ import (
 // Unlike GitHub App installations (one platform-wide app, per-account
 // installation, GitHub-issued installation_id), GitLab has no equivalent
 // "app" concept: each project owner configures its own project-level
-// webhook with a shared secret token. This integration mirrors that model —
-// one webhook_token per workspace (migration 128), used both as the URL
-// path segment that routes an inbound webhook to a workspace AND as the
-// value GitLab's X-Gitlab-Token header must echo (the project's Webhook
-// "Secret token" field is set to the same value). There is deliberately no
-// OAuth/installation flow, no repository auto-discovery, and no CI/pipeline
-// sync — see the PR description for scope. The read path (issue detail PR
+// webhook with a shared secret token. This integration mirrors that
+// per-project shape directly — one gitlab_integration row per registered
+// GitLab project (migration 155), not one shared token per workspace. A
+// workspace can register many projects, mirroring how Octo/Lark already
+// support multiple bots per workspace. The webhook URL's path segment is the
+// integration's id (a routing key, not itself a secret); the actual
+// credential is webhook_secret, verified against the X-Gitlab-Token header.
+// Inbound payloads are further checked against the registered
+// gitlab_project_id (GitLab's stable numeric identity, not the renameable
+// path) before being trusted — closing the hole where a v1 workspace-wide
+// token could forge events for any project. The read path (issue detail PR
 // card, ListPullRequestsByIssue) and the auto-link/auto-close engine
 // (extractIdentifiers/lookupIssueByIdentifier/advanceIssueToDone) are
 // entirely reused from github.go — this file only adds MR ingestion.
 
-// GitLabIntegrationResponse is the JSON shape returned by the integration
-// status/webhook-URL endpoints. WebhookURL is only ever included in the
-// create/rotate response (the moment the plaintext token is known) — same
+// GitLabIntegrationResponse is the JSON shape for one registered GitLab
+// project integration. WebhookURL / WebhookSecret are only ever included in
+// the create response, the moment the plaintext secret is known — same
 // "shown once" pattern as WebhookSubscriptionResponse's signing secret.
 type GitLabIntegrationResponse struct {
-	WorkspaceID string  `json:"workspace_id"`
-	Configured  bool    `json:"configured"`
-	WebhookURL  *string `json:"webhook_url,omitempty"`
-	CreatedAt   *string `json:"created_at,omitempty"`
+	ID                string  `json:"id"`
+	WorkspaceID       string  `json:"workspace_id"`
+	GitlabHost        string  `json:"gitlab_host"`
+	GitlabProjectID   int64   `json:"gitlab_project_id"`
+	GitlabProjectPath string  `json:"gitlab_project_path"`
+	CreatedAt         string  `json:"created_at"`
+	WebhookURL        *string `json:"webhook_url,omitempty"`
+	WebhookSecret     *string `json:"webhook_secret,omitempty"`
 }
 
-const gitlabWebhookTokenPrefix = "glwt_"
-
-func generateGitLabWebhookToken() (string, error) {
-	return generateCredential(gitlabWebhookTokenPrefix)
+type ListGitLabIntegrationsResponse struct {
+	Integrations []GitLabIntegrationResponse `json:"integrations"`
 }
 
-// GetGitLabIntegration reports whether the workspace has a GitLab webhook
-// configured, without revealing the token (it is only ever shown once, on
-// create/rotate — see CreateOrRotateGitLabIntegration). Mounted in the
-// member-visible route group (mirrors ListGitHubInstallations) — auth is
-// enforced by that group's middleware, not re-checked here.
-func (h *Handler) GetGitLabIntegration(w http.ResponseWriter, r *http.Request) {
+type CreateGitLabIntegrationRequest struct {
+	GitlabHost        string `json:"gitlab_host"`
+	GitlabProjectID   int64  `json:"gitlab_project_id"`
+	GitlabProjectPath string `json:"gitlab_project_path"`
+}
+
+func gitlabIntegrationToResponse(integ db.GitlabIntegration) GitLabIntegrationResponse {
+	return GitLabIntegrationResponse{
+		ID:                uuidToString(integ.ID),
+		WorkspaceID:       uuidToString(integ.WorkspaceID),
+		GitlabHost:        integ.GitlabHost,
+		GitlabProjectID:   integ.GitlabProjectID,
+		GitlabProjectPath: integ.GitlabProjectPath,
+		CreatedAt:         timestampToString(integ.CreatedAt),
+	}
+}
+
+const gitlabWebhookSecretPrefix = "glws_"
+
+func generateGitLabWebhookSecret() (string, error) {
+	return generateCredential(gitlabWebhookSecretPrefix)
+}
+
+// ListGitLabIntegrations lists the workspace's registered GitLab project
+// integrations. Never includes webhook_secret — that is shown exactly once,
+// in CreateGitLabIntegration's response. Mounted in the member-visible route
+// group (mirrors ListGitHubInstallations) — auth is enforced by that group's
+// middleware, not re-checked here.
+func (h *Handler) ListGitLabIntegrations(w http.ResponseWriter, r *http.Request) {
 	workspaceID := chi.URLParam(r, "id")
 	wsUUID, ok := parseUUIDOrBadRequest(w, workspaceID, "workspace id")
 	if !ok {
 		return
 	}
-	integ, err := h.Queries.GetGitLabIntegrationByWorkspace(r.Context(), wsUUID)
+	rows, err := h.Queries.ListGitLabIntegrationsByWorkspace(r.Context(), wsUUID)
 	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			writeJSON(w, http.StatusOK, GitLabIntegrationResponse{
-				WorkspaceID: workspaceID,
-				Configured:  false,
-			})
-			return
-		}
-		writeError(w, http.StatusInternalServerError, "failed to load GitLab integration")
+		writeError(w, http.StatusInternalServerError, "failed to load GitLab integrations")
 		return
 	}
-	writeJSON(w, http.StatusOK, GitLabIntegrationResponse{
-		WorkspaceID: workspaceID,
-		Configured:  true,
-		CreatedAt:   timestampToPtr(integ.CreatedAt),
-	})
+	resp := ListGitLabIntegrationsResponse{Integrations: make([]GitLabIntegrationResponse, 0, len(rows))}
+	for _, row := range rows {
+		resp.Integrations = append(resp.Integrations, gitlabIntegrationToResponse(row))
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
-// CreateOrRotateGitLabIntegration issues a fresh webhook token for the
-// workspace (creating the row if absent, replacing the token if already
-// configured — ON CONFLICT DO UPDATE in the query). The full webhook URL is
-// returned in the body exactly once; subsequent GetGitLabIntegration calls
-// only report configured=true. Rotating invalidates the previous URL
-// immediately (old inbound requests 401), matching webhook_subscription's
-// rotate semantics elsewhere in this handler package. Mounted in the
-// admin-only route group (mirrors GitHubConnect/DeleteGitHubInstallation) —
-// this credential lets an inbound webhook mutate issue status, same
-// privilege bar as CreateWebhookSubscription.
-func (h *Handler) CreateOrRotateGitLabIntegration(w http.ResponseWriter, r *http.Request) {
+// CreateGitLabIntegration registers a GitLab project's webhook: generates a
+// fresh secret, stores the (host, numeric project id, display path) triple,
+// and returns the full webhook URL + secret exactly once. Re-registering the
+// same (workspace, host, project id) rotates the secret rather than erroring
+// (the query's ON CONFLICT DO UPDATE) — the previous webhook URL keeps
+// routing to the same integration row, but the old secret stops verifying
+// immediately. Mounted in the admin-only route group (mirrors
+// GitHubConnect/DeleteGitHubInstallation) — this credential lets an inbound
+// webhook mutate issue status, same privilege bar as
+// CreateWebhookSubscription.
+func (h *Handler) CreateGitLabIntegration(w http.ResponseWriter, r *http.Request) {
 	workspaceID := chi.URLParam(r, "id")
 	wsUUID, ok := parseUUIDOrBadRequest(w, workspaceID, "workspace id")
 	if !ok {
@@ -104,75 +127,131 @@ func (h *Handler) CreateOrRotateGitLabIntegration(w http.ResponseWriter, r *http
 		writeError(w, http.StatusInternalServerError, "member not found in context")
 		return
 	}
-	token, err := generateGitLabWebhookToken()
+	var req CreateGitLabIntegrationRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	req.GitlabHost = strings.TrimSpace(req.GitlabHost)
+	req.GitlabProjectPath = strings.TrimSpace(req.GitlabProjectPath)
+	if req.GitlabHost == "" {
+		writeError(w, http.StatusBadRequest, "gitlab_host is required")
+		return
+	}
+	if req.GitlabProjectID <= 0 {
+		writeError(w, http.StatusBadRequest, "gitlab_project_id must be a positive integer")
+		return
+	}
+	if req.GitlabProjectPath == "" {
+		writeError(w, http.StatusBadRequest, "gitlab_project_path is required")
+		return
+	}
+	secret, err := generateGitLabWebhookSecret()
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to generate webhook token")
+		writeError(w, http.StatusInternalServerError, "failed to generate webhook secret")
 		return
 	}
 	integ, err := h.Queries.CreateGitLabIntegration(r.Context(), db.CreateGitLabIntegrationParams{
-		WorkspaceID:  wsUUID,
-		WebhookToken: token,
-		CreatedByID:  member.UserID,
+		WorkspaceID:       wsUUID,
+		GitlabHost:        req.GitlabHost,
+		GitlabProjectID:   req.GitlabProjectID,
+		GitlabProjectPath: req.GitlabProjectPath,
+		WebhookSecret:     secret,
+		CreatedByID:       member.UserID,
 	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to save GitLab integration")
 		return
 	}
-	url := gitlabWebhookURL(r, integ.WebhookToken)
-	writeJSON(w, http.StatusCreated, GitLabIntegrationResponse{
-		WorkspaceID: workspaceID,
-		Configured:  true,
-		WebhookURL:  &url,
-		CreatedAt:   timestampToPtr(integ.CreatedAt),
-	})
+	resp := gitlabIntegrationToResponse(integ)
+	url := gitlabWebhookURL(r, uuidToString(integ.ID))
+	resp.WebhookURL = &url
+	resp.WebhookSecret = &secret
+	writeJSON(w, http.StatusCreated, resp)
+}
+
+// DeleteGitLabIntegration removes a registered GitLab project integration.
+// Scoped by (id, workspace_id) like DeleteGitHubInstallation, so a caller
+// can never delete another workspace's integration by guessing an id.
+// Admin-only, mirroring DeleteGitHubInstallation's privilege bar.
+func (h *Handler) DeleteGitLabIntegration(w http.ResponseWriter, r *http.Request) {
+	workspaceID := chi.URLParam(r, "id")
+	wsUUID, ok := parseUUIDOrBadRequest(w, workspaceID, "workspace id")
+	if !ok {
+		return
+	}
+	id := chi.URLParam(r, "integrationId")
+	idUUID, ok := parseUUIDOrBadRequest(w, id, "integration id")
+	if !ok {
+		return
+	}
+	if _, err := h.Queries.DeleteGitLabIntegration(r.Context(), db.DeleteGitLabIntegrationParams{
+		ID:          idUUID,
+		WorkspaceID: wsUUID,
+	}); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "GitLab integration not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to remove GitLab integration")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // gitlabWebhookURL builds the absolute webhook URL a user pastes into
 // GitLab's project Settings → Webhooks page. Derives scheme/host from the
 // inbound request rather than a hardcoded base — this handler has no
 // equivalent of GitHub App's fixed callback URL to anchor on, and the
-// workspace could be served from any configured host.
-func gitlabWebhookURL(r *http.Request, token string) string {
+// workspace could be served from any configured host. integrationID is a
+// routing key, not a secret (see the package doc comment) — it is fine for
+// it to appear in the URL, unlike the webhook_secret.
+func gitlabWebhookURL(r *http.Request, integrationID string) string {
 	scheme := "https"
 	if r.TLS == nil && r.Header.Get("X-Forwarded-Proto") != "https" {
 		scheme = "http"
 	}
-	return fmt.Sprintf("%s://%s/api/webhooks/gitlab/%s", scheme, r.Host, token)
+	return fmt.Sprintf("%s://%s/api/webhooks/gitlab/%s", scheme, r.Host, integrationID)
 }
 
-// verifyGitLabToken constant-time compares the X-Gitlab-Token header against
-// the URL path token. GitLab echoes back whatever is configured as the
-// project webhook's "Secret token" field — operators are instructed to set
-// that field to the same value as the URL token, so a mismatch here means
-// either a misconfigured project or a forged request; both are rejected
-// identically to avoid leaking which case occurred.
-func verifyGitLabToken(header http.Header, urlToken string) bool {
+// verifyGitLabSecret constant-time compares the X-Gitlab-Token header
+// against the integration's registered secret. GitLab echoes back whatever
+// is configured as the project webhook's "Secret token" field — operators
+// are instructed to paste the secret shown at registration time into that
+// field.
+func verifyGitLabSecret(header http.Header, secret string) bool {
 	got := header.Get("X-Gitlab-Token")
-	return subtle.ConstantTimeCompare([]byte(got), []byte(urlToken)) == 1
+	return subtle.ConstantTimeCompare([]byte(got), []byte(secret)) == 1
 }
 
-// HandleGitLabWebhook is the inbound merge-request webhook endpoint,
-// mounted at POST /api/webhooks/gitlab/{token}. The path token is the sole
-// workspace router (looked up via GetGitLabIntegrationByToken) and doubles
-// as the webhook secret verified against X-Gitlab-Token.
+// HandleGitLabWebhook is the inbound merge-request webhook endpoint, mounted
+// at POST /api/webhooks/gitlab/{integrationId}. The path segment is a
+// routing key (looked up via GetGitLabIntegrationByID); the actual
+// credential is the X-Gitlab-Token header, verified against the
+// integration's webhook_secret.
 func (h *Handler) HandleGitLabWebhook(w http.ResponseWriter, r *http.Request) {
-	token := chi.URLParam(r, "token")
-	if token == "" {
-		writeError(w, http.StatusUnauthorized, "missing token")
+	integrationID := chi.URLParam(r, "integrationId")
+	if integrationID == "" {
+		writeError(w, http.StatusUnauthorized, "missing integration id")
 		return
 	}
-	integ, err := h.Queries.GetGitLabIntegrationByToken(r.Context(), token)
+	idUUID, err := util.ParseUUID(integrationID)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, "invalid integration id")
+		return
+	}
+	integ, err := h.Queries.GetGitLabIntegrationByID(r.Context(), idUUID)
 	if err != nil {
 		if !errors.Is(err, pgx.ErrNoRows) {
 			slog.Warn("gitlab: lookup integration failed", "err", err)
 		}
-		// Same response whether the token is malformed or simply unknown —
-		// no information about which case occurred.
-		writeError(w, http.StatusUnauthorized, "invalid token")
+		// Same response whether the id is malformed or simply unknown — no
+		// information about which case occurred.
+		writeError(w, http.StatusUnauthorized, "invalid integration id")
 		return
 	}
-	if !verifyGitLabToken(r.Header, token) {
-		writeError(w, http.StatusUnauthorized, "invalid token")
+	if !verifyGitLabSecret(r.Header, integ.WebhookSecret) {
+		writeError(w, http.StatusUnauthorized, "invalid webhook secret")
 		return
 	}
 
@@ -185,7 +264,28 @@ func (h *Handler) HandleGitLabWebhook(w http.ResponseWriter, r *http.Request) {
 	event := strings.TrimSpace(r.Header.Get("X-Gitlab-Event"))
 	switch event {
 	case "Merge Request Hook":
-		h.handleMergeRequestEvent(r.Context(), integ.WorkspaceID, body)
+		var p glMergeRequestPayload
+		if err := json.Unmarshal(body, &p); err != nil {
+			slog.Warn("gitlab: bad merge_request payload", "err", err)
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+		// The secret alone proves the request knows this integration's
+		// credential; this additionally proves the payload is actually
+		// describing the ONE project this integration was registered for,
+		// not a different project whose admin (accidentally or not) pasted
+		// this integration's URL/secret into their own project's webhook
+		// settings. Unlike the token/secret check above, this happens after
+		// auth already succeeded, so a specific 400 here is an operator-
+		// facing misconfiguration signal, not information leaked to an
+		// unauthenticated attacker.
+		if p.Project.ID != integ.GitlabProjectID {
+			slog.Warn("gitlab: payload project id does not match registered integration",
+				"integration_id", integrationID, "registered_project_id", integ.GitlabProjectID, "payload_project_id", p.Project.ID)
+			writeError(w, http.StatusBadRequest, "webhook is configured for a different GitLab project")
+			return
+		}
+		h.handleMergeRequestEvent(r.Context(), integ, p)
 	default:
 		// Acknowledge every event so GitLab doesn't mark the endpoint
 		// failing, but ignore types we don't model (push, note, pipeline,
@@ -196,23 +296,31 @@ func (h *Handler) HandleGitLabWebhook(w http.ResponseWriter, r *http.Request) {
 }
 
 // glMergeRequestPayload models only the fields this handler consumes from
-// GitLab's "Merge Request Hook" payload. Field names/shape verified against
-// adapter_gitlab.go's glMergeRequestEvent (Octo's GitLab adapter) during the
-// A3 investigation — both sides parse the same GitLab-defined wire shape.
+// GitLab's "Merge Request Hook" payload. Field presence verified against
+// GitLab's documented webhook payload reference (docs.gitlab.com/user/
+// project/integrations/webhook_events/) — created_at/updated_at/merged_at/
+// action/draft (draft replaces the deprecated work_in_progress) and
+// project.id are all real fields GitLab actually sends, not assumed.
 type glMergeRequestPayload struct {
 	ObjectAttributes struct {
 		IID                 int32  `json:"iid"`
 		Title               string `json:"title"`
 		Description         string `json:"description"`
 		State               string `json:"state"`
+		Action              string `json:"action"`
 		URL                 string `json:"url"`
 		SourceBranch        string `json:"source_branch"`
-		WorkInProgress      bool   `json:"work_in_progress"`
+		Draft               bool   `json:"draft"`
 		MergeStatus         string `json:"merge_status"`
 		DetailedMergeStatus string `json:"detailed_merge_status"`
 		MergeCommitSha      string `json:"merge_commit_sha"`
+		CreatedAt           string `json:"created_at"`
+		UpdatedAt           string `json:"updated_at"`
+		// MergedAt is absent/empty until the MR is actually merged.
+		MergedAt string `json:"merged_at"`
 	} `json:"object_attributes"`
 	Project struct {
+		ID                int64  `json:"id"`
 		PathWithNamespace string `json:"path_with_namespace"`
 	} `json:"project"`
 	User struct {
@@ -220,23 +328,42 @@ type glMergeRequestPayload struct {
 	} `json:"user"`
 }
 
+// gitlabTimeLayouts are the wire formats GitLab has used for
+// object_attributes timestamps across versions: modern ISO 8601, and the
+// legacy space-separated "<date> <time> <ZONE>" format shown in GitLab's own
+// documented payload example. Both are tried; an unrecognized format warns
+// and falls back rather than failing the whole webhook.
+var gitlabTimeLayouts = []string{
+	time.RFC3339,
+	"2006-01-02 15:04:05 MST",
+}
+
+func parseGitLabTime(s string) pgtype.Timestamptz {
+	if s == "" {
+		return pgtype.Timestamptz{}
+	}
+	for _, layout := range gitlabTimeLayouts {
+		if t, err := time.Parse(layout, s); err == nil {
+			return pgtype.Timestamptz{Time: t.UTC(), Valid: true}
+		}
+	}
+	slog.Warn("gitlab: unrecognized timestamp format", "value", s)
+	return pgtype.Timestamptz{}
+}
+
 // handleMergeRequestEvent upserts the MR mirror row, then runs the same
 // auto-link + auto-close-on-merge logic as GitHub's handlePullRequestEvent
-// (github.go:866-956), reusing extractIdentifiers/extractClosingIdentifiers/
-// lookupIssueByIdentifier/LinkIssueToPullRequest/advanceIssueToDone
-// verbatim. GitLab MR webhooks don't include per-commit diff stats
-// (additions/deletions/changed_files), so those fields are left at their
-// zero value — the frontend already treats total==0 as "unknown" and hides
-// the stats row (see pull-request-list.tsx), so this degrades gracefully
-// rather than needing a GitLab-specific UI path.
-func (h *Handler) handleMergeRequestEvent(ctx context.Context, workspaceID pgtype.UUID, body []byte) {
-	var p glMergeRequestPayload
-	if err := json.Unmarshal(body, &p); err != nil {
-		slog.Warn("gitlab: bad merge_request payload", "err", err)
-		return
-	}
-
-	state := deriveMRState(p.ObjectAttributes.State, p.ObjectAttributes.WorkInProgress)
+// (github.go's pull_request handling), reusing extractIdentifiers/
+// extractClosingIdentifiers/lookupIssueByIdentifier/LinkIssueToPullRequest/
+// advanceIssueToDone verbatim. GitLab MR webhooks don't include per-commit
+// diff stats (additions/deletions/changed_files), so those fields are left
+// at their zero value — the frontend already treats total==0 as "unknown"
+// and hides the stats row (see pull-request-list.tsx), so this degrades
+// gracefully rather than needing a GitLab-specific UI path. The caller has
+// already validated p.Project.ID against integ.GitlabProjectID.
+func (h *Handler) handleMergeRequestEvent(ctx context.Context, integ db.GitlabIntegration, p glMergeRequestPayload) {
+	workspaceID := integ.WorkspaceID
+	state := deriveMRState(p.ObjectAttributes.State, p.ObjectAttributes.Draft)
 	mergeable := deriveMRMergeableState(p.ObjectAttributes.DetailedMergeStatus, p.ObjectAttributes.MergeStatus)
 
 	pathParts := strings.Split(p.Project.PathWithNamespace, "/")
@@ -246,28 +373,31 @@ func (h *Handler) handleMergeRequestEvent(ctx context.Context, workspaceID pgtyp
 		repoName = pathParts[n-1]
 	}
 
-	// GitLab's Merge Request Hook payload carries no separate MR
-	// created_at/updated_at fields on object_attributes (unlike GitHub's
-	// pull_request payload) — stamp both with "when this webhook was
-	// processed" instead. This means pr_created_at drifts forward on every
-	// webhook delivery rather than reflecting the MR's true creation time;
-	// acceptable for v1 since the frontend only displays pr_updated_at
-	// (relative "updated Xm ago"), not pr_created_at.
-	now := pgtype.Timestamptz{Time: time.Now().UTC(), Valid: true}
+	createdAt := parseGitLabTime(p.ObjectAttributes.CreatedAt)
+	if !createdAt.Valid {
+		createdAt = pgtype.Timestamptz{Time: time.Now().UTC(), Valid: true}
+	}
+	updatedAt := parseGitLabTime(p.ObjectAttributes.UpdatedAt)
+	if !updatedAt.Valid {
+		updatedAt = pgtype.Timestamptz{Time: time.Now().UTC(), Valid: true}
+	}
+	mergedAt := parseGitLabTime(p.ObjectAttributes.MergedAt)
+
 	pr, err := h.Queries.UpsertGitLabMergeRequest(ctx, db.UpsertGitLabMergeRequestParams{
 		WorkspaceID:    workspaceID,
+		ProviderHost:   integ.GitlabHost,
 		RepoOwner:      repoOwner,
 		RepoName:       repoName,
 		PrNumber:       p.ObjectAttributes.IID,
 		Title:          p.ObjectAttributes.Title,
 		State:          state,
 		HtmlUrl:        p.ObjectAttributes.URL,
-		PrCreatedAt:    now,
-		PrUpdatedAt:    now,
+		PrCreatedAt:    createdAt,
+		PrUpdatedAt:    updatedAt,
 		HeadSha:        p.ObjectAttributes.MergeCommitSha,
 		Branch:         strToText(p.ObjectAttributes.SourceBranch),
 		AuthorLogin:    strToText(p.User.Username),
-		MergedAt:       mergedAtIfState(state, now),
+		MergedAt:       mergedAt,
 		MergeableState: mergeable,
 	})
 	if err != nil {
@@ -281,17 +411,23 @@ func (h *Handler) handleMergeRequestEvent(ctx context.Context, workspaceID pgtyp
 	// Unlike GitHub's handlePullRequestEvent, this does not check an
 	// equivalent of workspaceAutoLinkPRsEnabled — there is no separate
 	// "GitLab enabled" workspace setting for v1 (see PR description's "not
-	// covered" section). Configuring the webhook at all (creating a
-	// gitlab_integration row) is treated as consent to auto-link; a
-	// workspace that wants MR mirroring without auto-link would need to
-	// delete the integration entirely, same tradeoff GitHub's flag was
-	// introduced (RFC MUL-2414) specifically to avoid.
+	// covered" section). Registering the webhook at all (creating a
+	// gitlab_integration row for a project) is treated as consent to
+	// auto-link for that project; a workspace that wants MR mirroring
+	// without auto-link would need to delete the integration entirely, same
+	// tradeoff GitHub's flag was introduced (RFC MUL-2414) specifically to
+	// avoid.
 	linkedIssueIDs := make([]string, 0)
 	idents := extractIdentifiers(p.ObjectAttributes.Title, p.ObjectAttributes.Description, p.ObjectAttributes.SourceBranch)
 	closingIdents := map[string]struct{}{}
 	for _, c := range extractClosingIdentifiers(p.ObjectAttributes.Title, p.ObjectAttributes.Description) {
 		closingIdents[c] = struct{}{}
 	}
+	// close_intent should follow the MR title/description while the MR is
+	// still editable before its terminal close/merge event. Once GitLab has
+	// delivered a terminal action, later update events must not rewrite the
+	// merge-time close decision — mirrors GitHub's preserveCloseIntent.
+	preserveCloseIntent := deriveMRPreserveCloseIntent(p.ObjectAttributes.Action, state)
 	prefix := h.getIssuePrefix(ctx, workspaceID)
 	reevalIssues := make([]db.Issue, 0, len(idents))
 	for _, id := range idents {
@@ -300,19 +436,14 @@ func (h *Handler) handleMergeRequestEvent(ctx context.Context, workspaceID pgtyp
 			continue
 		}
 		_, declared := closingIdents[id]
-		// PreserveCloseIntent is always false here (GitHub's equivalent,
-		// preserveCloseIntent in handlePullRequestEvent, guards against a
-		// post-merge title/body edit clobbering the merge-time close
-		// decision — this handler has no action field to detect that case
-		// on, and in practice GitLab does not re-fire Merge Request Hook
-		// for a merged MR's title/description after the fact, so the gap
-		// is theoretical for v1).
+		closeIntent := declared && !preserveCloseIntent
 		if err := h.Queries.LinkIssueToPullRequest(ctx, db.LinkIssueToPullRequestParams{
-			IssueID:       issue.ID,
-			PullRequestID: pr.ID,
-			CloseIntent:   declared,
-			LinkedByType:  strToText("system"),
-			LinkedByID:    pgtype.UUID{},
+			IssueID:             issue.ID,
+			PullRequestID:       pr.ID,
+			CloseIntent:         closeIntent,
+			PreserveCloseIntent: preserveCloseIntent,
+			LinkedByType:        strToText("system"),
+			LinkedByID:          pgtype.UUID{},
 		}); err != nil {
 			slog.Warn("gitlab: link failed", "err", err)
 			continue
@@ -349,14 +480,14 @@ func (h *Handler) handleMergeRequestEvent(ctx context.Context, workspaceID pgtyp
 // during merge processing) has no clean equivalent and is treated as
 // "closed" rather than invented as a fifth state the CHECK constraint and
 // frontend would both need to learn about.
-func deriveMRState(state string, workInProgress bool) string {
+func deriveMRState(state string, draft bool) string {
 	switch state {
 	case "merged":
 		return "merged"
 	case "closed", "locked":
 		return "closed"
 	default: // "opened", "reopened", or any future value GitLab adds
-		if workInProgress {
+		if draft {
 			return "draft"
 		}
 		return "open"
@@ -386,20 +517,18 @@ func deriveMRMergeableState(detailed, legacy string) pgtype.Text {
 	}
 }
 
-// mergedAtIfState stamps merged_at with the current time when the derived
-// state is "merged" — GitLab's webhook payload carries no equivalent field
-// on object_attributes (unlike GitHub's pull_request.merged_at), so "the
-// moment this webhook was processed" is the closest available
-// approximation. Returns an invalid (NULL) timestamp for every other
-// state. Note UpsertGitLabMergeRequest's ON CONFLICT always overwrites
-// merged_at from the incoming value (same as GitHub's upsert does for its
-// own merged_at), so a later non-merge event on an already-merged MR would
-// clear this back to NULL — an accepted v1 simplification (see the PR
-// description's "not covered" section) since GitLab doesn't fire further
-// state-changing events on a merged MR in practice.
-func mergedAtIfState(state string, now pgtype.Timestamptz) pgtype.Timestamptz {
-	if state != "merged" {
-		return pgtype.Timestamptz{}
-	}
-	return now
+// deriveMRPreserveCloseIntent mirrors GitHub's preserveCloseIntent
+// (handlePullRequestEvent): while THIS webhook delivery is itself the
+// terminal event (the MR just closed or just merged), close_intent should
+// be computed fresh from the current title/description — that is the
+// authoritative moment to lock in the decision. Once a terminal event has
+// already been delivered, a LATER non-terminal update (e.g. a label change
+// on an already-merged MR) must not rewrite that locked-in decision.
+// GitLab models "closed without merging" and "merged" as two distinct
+// action values — "close" and "merge" — unlike GitHub, which reports both
+// under the single action "closed" (with reference to a merged flag
+// alongside it); both are terminal here.
+func deriveMRPreserveCloseIntent(action, state string) bool {
+	isTerminalAction := action == "close" || action == "merge"
+	return !isTerminalAction && (state == "merged" || state == "closed")
 }

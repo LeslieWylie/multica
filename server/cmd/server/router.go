@@ -631,11 +631,12 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	// HMAC-SHA256 signature in the handler) and post-install setup callback.
 	r.Post("/api/webhooks/github", h.HandleGitHubWebhook)
 	r.Get("/api/github/setup", h.GitHubSetupCallback)
-	// GitLab merge-request webhook. Like the autopilot webhook above, the
-	// path token IS the credential — it both routes the request to a
-	// workspace (GetGitLabIntegrationByToken) and is checked against the
-	// X-Gitlab-Token header inside the handler.
-	r.Post("/api/webhooks/gitlab/{token}", h.HandleGitLabWebhook)
+	// GitLab merge-request webhook. Unlike the autopilot webhook above, the
+	// path segment is a routing key only (looked up via
+	// GetGitLabIntegrationByID) — the actual credential is the
+	// X-Gitlab-Token header, checked against the integration's
+	// webhook_secret inside the handler.
+	r.Post("/api/webhooks/gitlab/{integrationId}", h.HandleGitLabWebhook)
 	// Stripe webhook (no Multica auth — Stripe signs the raw body
 	// with a shared secret, the multica-cloud upstream verifies. We
 	// only forward the bytes + the Stripe-Signature header; see
@@ -733,9 +734,9 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					// can_manage hint so the UI can gate connect/disconnect.
 					r.Get("/github/installations", h.ListGitHubInstallations)
 					// GitLab integration — same member-visible rationale as
-					// GitHub's list endpoint above; never reveals the token
-					// itself (see GetGitLabIntegration).
-					r.Get("/gitlab", h.GetGitLabIntegration)
+					// GitHub's list endpoint above; never reveals
+					// webhook_secret (see ListGitLabIntegrations).
+					r.Get("/gitlab/integrations", h.ListGitLabIntegrations)
 					// Custom runtime profiles — listing/reading is member-visible
 					// (the Runtime page renders for everyone; create/edit/delete
 					// are admin-gated below).
@@ -771,12 +772,13 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					r.Delete("/github/installations/{installationId}", h.DeleteGitHubInstallation)
 				})
 
-				// GitLab integration — create/rotate is admin-only, same
-				// privilege bar as GitHub connect (the webhook token lets an
+				// GitLab integration — register/remove is admin-only, same
+				// privilege bar as GitHub connect (the webhook secret lets an
 				// inbound request mutate issue status).
 				r.Group(func(r chi.Router) {
 					r.Use(middleware.RequireWorkspaceRoleFromURL(queries, "id", "owner", "admin"))
-					r.Post("/gitlab/rotate", h.CreateOrRotateGitLabIntegration)
+					r.Post("/gitlab/integrations", h.CreateGitLabIntegration)
+					r.Delete("/gitlab/integrations/{integrationId}", h.DeleteGitLabIntegration)
 				})
 
 				// Lark integration. Listing is member-visible (same

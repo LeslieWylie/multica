@@ -115,6 +115,8 @@ import type {
   ListGitHubInstallationsResponse,
   GitHubConnectResponse,
   GitLabIntegrationResponse,
+  ListGitLabIntegrationsResponse,
+  CreateGitLabIntegrationRequest,
   ListLarkInstallationsResponse,
   BeginLarkInstallResponse,
   LarkInstallStatusResponse,
@@ -2356,13 +2358,25 @@ export class ApiClient {
     return this.fetch(`/api/issues/${issueId}/pull-requests`);
   }
 
-  // GitLab integration — per-workspace webhook token (see gitlab.ts types).
-  async getGitLabIntegration(workspaceId: string): Promise<GitLabIntegrationResponse> {
-    return this.fetch(`/api/workspaces/${workspaceId}/gitlab`);
+  // GitLab integration — per-project registration (see gitlab.ts types).
+  async listGitLabIntegrations(workspaceId: string): Promise<ListGitLabIntegrationsResponse> {
+    return this.fetch(`/api/workspaces/${workspaceId}/gitlab/integrations`);
   }
 
-  async rotateGitLabIntegration(workspaceId: string): Promise<GitLabIntegrationResponse> {
-    return this.fetch(`/api/workspaces/${workspaceId}/gitlab/rotate`, { method: "POST" });
+  async createGitLabIntegration(
+    workspaceId: string,
+    data: CreateGitLabIntegrationRequest,
+  ): Promise<GitLabIntegrationResponse> {
+    return this.fetch(`/api/workspaces/${workspaceId}/gitlab/integrations`, {
+      method: "POST",
+      body: JSON.stringify(data),
+    });
+  }
+
+  async deleteGitLabIntegration(workspaceId: string, integrationId: string): Promise<void> {
+    await this.fetch(`/api/workspaces/${workspaceId}/gitlab/integrations/${integrationId}`, {
+      method: "DELETE",
+    });
   }
 
   // Lark integration
