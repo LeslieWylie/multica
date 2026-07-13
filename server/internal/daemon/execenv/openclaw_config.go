@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -43,17 +44,26 @@ var openclawCLITimeout = openclawCLITimeoutFromEnv()
 const (
 	envOpenclawCLITimeoutSeconds     = "MULTICA_OPENCLAW_CLI_TIMEOUT_SECONDS"
 	defaultOpenclawCLITimeoutSeconds = 5
+	// maxOpenclawCLITimeoutSeconds caps the env override at the largest
+	// second count that fits in a time.Duration (int64 nanoseconds) without
+	// overflowing. Above this, n * time.Second wraps silently (Go doesn't
+	// panic on integer overflow) and can produce a negative Duration —
+	// context.WithTimeout then sees an already-expired deadline and cancels
+	// immediately, failing every task's OpenClaw prep instead of the
+	// intended "use a very long timeout".
+	maxOpenclawCLITimeoutSeconds = math.MaxInt64 / int64(time.Second)
 )
 
 // openclawCLITimeoutFromEnv reads MULTICA_OPENCLAW_CLI_TIMEOUT_SECONDS (a
-// positive integer number of seconds) or falls back to
-// defaultOpenclawCLITimeoutSeconds. An unset, empty, non-numeric, or
-// non-positive value falls back rather than erroring — this is a task-prep
-// timeout, not a correctness-critical setting, so a malformed override
-// should degrade to the default instead of failing daemon startup.
+// positive integer number of seconds, capped at maxOpenclawCLITimeoutSeconds)
+// or falls back to defaultOpenclawCLITimeoutSeconds. An unset, empty,
+// non-numeric, non-positive, or overflowing value falls back rather than
+// erroring — this is a task-prep timeout, not a correctness-critical
+// setting, so a malformed override should degrade to the default instead of
+// failing daemon startup.
 func openclawCLITimeoutFromEnv() time.Duration {
 	if raw := strings.TrimSpace(os.Getenv(envOpenclawCLITimeoutSeconds)); raw != "" {
-		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+		if n, err := strconv.ParseInt(raw, 10, 64); err == nil && n > 0 && n <= maxOpenclawCLITimeoutSeconds {
 			return time.Duration(n) * time.Second
 		}
 	}
