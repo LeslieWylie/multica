@@ -158,6 +158,44 @@ func buildCommentPrompt(task Task, provider string) string {
 		}
 		fmt.Fprintf(&b, "[NEW COMMENT] %s just left a new comment. Focus on THIS comment — do not confuse it with previous ones:\n\n", authorLabel)
 		fmt.Fprintf(&b, "> %s\n\n", task.TriggerCommentContent)
+		// MUL-4195: comments that arrived before this run started were folded
+		// into it rather than dropped. The trigger above is the newest; the
+		// agent must ALSO address these earlier ones so no deliberate user
+		// instruction is silently lost. Prefer the embedded detail so the agent
+		// does not have to guess which thread each folded comment lives in
+		// (they may span multiple threads — review should-fix #3); fall back to
+		// a thread-agnostic issue-wide fetch hint for old servers that only send
+		// the ids.
+		if len(task.CoalescedComments) > 0 {
+			fmt.Fprintf(&b, "This run also covers %d earlier comment(s) posted before it started — you must read and address them too, not just the one above. They may be in different threads, so each is reproduced here with its own thread:\n\n", len(task.CoalescedComments))
+			for _, cc := range task.CoalescedComments {
+				authorLabel := "A user"
+				if cc.AuthorType == "agent" {
+					name := cc.AuthorName
+					if name == "" {
+						name = "another agent"
+					}
+					authorLabel = fmt.Sprintf("Another agent (%s)", name)
+				} else if cc.AuthorName != "" {
+					authorLabel = cc.AuthorName
+				}
+				fmt.Fprintf(&b, "- comment %s", cc.ID)
+				if cc.CreatedAt != "" {
+					fmt.Fprintf(&b, " (%s, %s)", authorLabel, cc.CreatedAt)
+				} else {
+					fmt.Fprintf(&b, " (%s)", authorLabel)
+				}
+				if cc.ThreadID != "" {
+					fmt.Fprintf(&b, " [thread %s]", cc.ThreadID)
+				}
+				b.WriteString(":\n")
+				fmt.Fprintf(&b, "  > %s\n", strings.ReplaceAll(strings.TrimSpace(cc.Content), "\n", "\n  > "))
+			}
+			fmt.Fprintf(&b, "\nIf you need the surrounding discussion for any of them, fetch its thread with `multica issue comment list %s --thread <thread-id> --tail 30 --output json` using the thread id shown above.\n\n", task.IssueID)
+		} else if len(task.CoalescedCommentIDs) > 0 {
+			fmt.Fprintf(&b, "This run also covers %d earlier comment(s) posted before it started — you must read and address them too, not just the one above: %s. These may be in DIFFERENT threads, so do not assume they share the triggering thread; fetch each by pulling the issue-wide discussion with `multica issue comment list %s --recent 30 --output json` (expand with `--full` if a thread is folded) and locate the ids above.\n\n",
+				len(task.CoalescedCommentIDs), strings.Join(task.CoalescedCommentIDs, ", "), task.IssueID)
+		}
 		if task.TriggerAuthorType == "agent" {
 			b.WriteString("⚠️ The triggering comment was posted by another agent. Decide whether a reply is warranted. If you produced actual work this turn (investigated, fixed something, answered a real question), post the result as a normal reply — that is NOT a noise comment, and the standard rule that final results must be delivered via comment still applies. If the triggering comment was a pure acknowledgment, thanks, or sign-off AND you produced no work this turn, do NOT reply — and do NOT post a comment saying 'No reply needed' or similar. Simply exit with no output. Silence is the preferred way to end agent-to-agent threads. If you do reply, do not @mention the other agent as a sign-off (that re-triggers them and starts a loop).\n\n")
 		}
@@ -187,9 +225,42 @@ func buildCommentPrompt(task Task, provider string) string {
 
 // buildChatPrompt constructs a prompt for interactive chat tasks.
 func buildChatPrompt(task Task) string {
+	// Proactive self-introduction: the agent was just created and is opening the
+	// conversation. There is no user message to reply to — the agent sends the
+	// first message so the thread reads as the agent messaging its creator, not
+	// the creator prompting the agent (MUL-4230).
+	if task.ChatIntro {
+		var b strings.Builder
+		b.WriteString("You are running as a chat assistant for a Multica workspace.\n")
+		b.WriteString("You were just created, and this is the very first message in a direct chat with the person who created you. They have not written anything yet — you are opening the conversation. Send a short, warm, first-person introduction: who you are, what you're good at, and how they can work with you. Do NOT phrase it as an answer to a question or repeat any prompt back; just introduce yourself as if you reached out first.\n")
+		return b.String()
+	}
+
 	var b strings.Builder
 	b.WriteString("You are running as a chat assistant for a Multica workspace.\n")
 	b.WriteString("A user is chatting with you directly. Respond to their message.\n\n")
+	// Channel awareness (MUL-3871). When the session is backed by an IM channel,
+	// the agent must KNOW it is operating inside that channel — otherwise an ask
+	// like "what did you just talk about" sends it to read Multica instead of the
+	// Slack conversation. State it explicitly, point reads at the channel (not
+	// Multica), and teach the two read commands, telling the agent which to start
+	// with based on where it was @mentioned. A web-only chat session gets no such
+	// block — its history is the Multica chat_session the agent already resumes.
+	if task.ChatChannelType != "" {
+		platform := channelDisplayName(task.ChatChannelType)
+		fmt.Fprintf(&b, "You are operating inside a %s conversation — not the Multica web app. This conversation and its history live in %s, NOT in Multica; never look in Multica issues or comments for it. The message below may be only what triggered you. Read the conversation with:\n", platform, platform)
+		b.WriteString("- `multica chat history --output json` — the channel overview: recent top-level messages, each thread tagged with a `thread_id` and `reply_count`. It does NOT expand thread contents.\n")
+		b.WriteString("- `multica chat thread [<thread_id>] --output json` — read one thread's messages; omit the id to read the thread you are in, or pass a `thread_id` from the overview to read a specific thread.\n")
+		if task.ChatInThread {
+			b.WriteString("You were @mentioned inside a thread: start with `multica chat thread` to read it; if you need the wider channel, run `multica chat history` and open a specific thread with `multica chat thread <thread_id>`.\n")
+		} else {
+			b.WriteString("You were @mentioned at the channel top level: start with `multica chat history` to see the channel, then read a specific thread's contents with `multica chat thread <thread_id>`.\n")
+		}
+		// These reads are the agent's private context-gathering; narrating them
+		// into a chat reply reads as noise (the user reported every reply being
+		// prefixed with "我先读取…"). Tell the agent to keep them out of its answer.
+		b.WriteString("Do these reads SILENTLY as an internal step — they are how you gather context, not part of your answer. Do NOT narrate them: your reply must not begin with what you are about to read or just read (no \"我先读取…\" / \"let me read the history / open the thread\"). Reply to the user with your answer only.\n\n")
+	}
 	if task.Agent != nil && len(task.Agent.Skills) > 0 {
 		refs := ExtractSlashSkills(task.ChatMessage)
 		if len(refs) > 0 {
@@ -241,6 +312,16 @@ func buildChatPrompt(task Task) string {
 		b.WriteString("When creating an issue that should preserve one of these attachments, pass `--attachment-id <id>` to `multica issue create` in addition to keeping the attachment markdown inline.\n")
 	}
 	return b.String()
+}
+
+// channelDisplayName renders a chat_channel_type for prompt copy.
+func channelDisplayName(channelType string) string {
+	switch channelType {
+	case "slack":
+		return "Slack"
+	default:
+		return channelType
+	}
 }
 
 // buildAutopilotPrompt constructs a prompt for run_only autopilot tasks.

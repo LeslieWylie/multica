@@ -270,6 +270,67 @@ func TestBuildChatPromptAttachmentIDsCanBeBoundToCreatedIssues(t *testing.T) {
 	}
 }
 
+func TestBuildChatPromptChannelAwareness(t *testing.T) {
+	t.Run("slack-backed prompt teaches both read commands", func(t *testing.T) {
+		out := buildChatPrompt(Task{
+			ChatSessionID:   "sess-1",
+			ChatChannelType: "slack",
+			ChatMessage:     "你刚刚和 xxx 聊了什么",
+		})
+		for _, want := range []string{"Slack", "NOT in Multica", "multica chat history", "multica chat thread", "Do NOT narrate"} {
+			if !strings.Contains(out, want) {
+				t.Fatalf("slack-backed prompt missing %q\n--- output ---\n%s", want, out)
+			}
+		}
+	})
+
+	t.Run("top-level mention starts with history", func(t *testing.T) {
+		out := buildChatPrompt(Task{ChatSessionID: "s", ChatChannelType: "slack", ChatInThread: false, ChatMessage: "hi"})
+		if !strings.Contains(out, "top level: start with `multica chat history`") {
+			t.Fatalf("expected top-level guidance, got:\n%s", out)
+		}
+	})
+
+	t.Run("in-thread mention starts with thread", func(t *testing.T) {
+		out := buildChatPrompt(Task{ChatSessionID: "s", ChatChannelType: "slack", ChatInThread: true, ChatMessage: "hi"})
+		if !strings.Contains(out, "inside a thread: start with `multica chat thread`") {
+			t.Fatalf("expected in-thread guidance, got:\n%s", out)
+		}
+	})
+
+	t.Run("web-only session has no channel block", func(t *testing.T) {
+		out := buildChatPrompt(Task{
+			ChatSessionID: "sess-1",
+			ChatMessage:   "hi",
+		})
+		if strings.Contains(out, "multica chat history") {
+			t.Fatalf("web-only chat prompt should not mention channel history, got:\n%s", out)
+		}
+	})
+}
+
+func TestBuildChatPromptAgentIntro(t *testing.T) {
+	// The proactive self-introduction chat (MUL-4230) has no user message: the
+	// prompt must tell the agent to open the conversation itself, and must NOT
+	// carry the generic "respond to their message" framing or an empty
+	// "User message:" section that would confuse the agent.
+	out := buildChatPrompt(Task{ChatSessionID: "sess-1", ChatIntro: true})
+	for _, want := range []string{
+		"You were just created",
+		"you are opening the conversation",
+		"introduce yourself",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("intro prompt missing %q\n--- output ---\n%s", want, out)
+		}
+	}
+	for _, unwanted := range []string{"Respond to their message", "User message:"} {
+		if strings.Contains(out, unwanted) {
+			t.Fatalf("intro prompt should not contain %q\n--- output ---\n%s", unwanted, out)
+		}
+	}
+}
+
 func TestBuildChatPromptSlashSkills(t *testing.T) {
 	t.Run("injects selected skills block", func(t *testing.T) {
 		task := Task{
@@ -538,5 +599,80 @@ func TestBuildPromptResumedNoDeltaDoesNotForceThreadRead(t *testing.T) {
 	}
 	if strings.Contains(out, "Read the triggering conversation first") {
 		t.Errorf("resumed/no-delta prompt must not use the cold-start forced-read wording, got:\n%s", out)
+	}
+}
+
+// TestBuildCommentPromptCoalescedCrossThread pins MUL-4195 review should-fix #3:
+// when a run coalesces comments that span MULTIPLE threads, the prompt must
+// embed each folded comment's content with its OWN thread id instead of
+// claiming they all live in the triggering thread. The earlier version told the
+// agent "they are in the triggering thread" and handed a single `--thread`
+// command — wrong (and lossy) when the folded comments came from different
+// threads.
+func TestBuildCommentPromptCoalescedCrossThread(t *testing.T) {
+	task := Task{
+		IssueID:               "issue-xthread-1",
+		TriggerCommentID:      "trigger-newest",
+		TriggerThreadID:       "thread-root-A",
+		TriggerCommentContent: "latest instruction",
+		TriggerAuthorType:     "member",
+		CoalescedCommentIDs:   []string{"c-old-1", "c-old-2"},
+		CoalescedComments: []CoalescedCommentData{
+			{ID: "c-old-1", ThreadID: "thread-root-A", AuthorType: "member", AuthorName: "Alice", Content: "first earlier comment", CreatedAt: "2026-07-08T01:00:00Z"},
+			{ID: "c-old-2", ThreadID: "thread-root-B", AuthorType: "member", AuthorName: "Bob", Content: "comment in a different thread", CreatedAt: "2026-07-08T02:00:00Z"},
+		},
+	}
+	out := BuildPrompt(task, "claude")
+
+	// The stale same-thread assumption must be gone.
+	if strings.Contains(out, "they are in the triggering thread") {
+		t.Errorf("prompt must not assume coalesced comments share the triggering thread, got:\n%s", out)
+	}
+	// Each folded comment's content is embedded directly, so the agent never
+	// has to guess which thread to read to find it.
+	for _, want := range []string{"first earlier comment", "comment in a different thread"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("prompt must embed coalesced comment content %q, got:\n%s", want, out)
+		}
+	}
+	// Each distinct thread id is surfaced so a follow-up fetch targets the
+	// right thread — including the OTHER thread (B), not just the trigger's.
+	for _, want := range []string{"thread-root-A", "thread-root-B"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("prompt must surface coalesced comment thread id %q, got:\n%s", want, out)
+		}
+	}
+	// Both coalesced comment ids remain referenced.
+	for _, id := range []string{"c-old-1", "c-old-2"} {
+		if !strings.Contains(out, id) {
+			t.Errorf("prompt must reference coalesced comment id %s, got:\n%s", id, out)
+		}
+	}
+}
+
+// TestBuildCommentPromptCoalescedIDsOnlyFallback pins the old-server fallback:
+// when only coalesced ids are shipped (no embedded detail), the prompt must
+// still NOT assume a shared thread and must point at an issue-wide fetch.
+func TestBuildCommentPromptCoalescedIDsOnlyFallback(t *testing.T) {
+	task := Task{
+		IssueID:               "issue-fallback-1",
+		TriggerCommentID:      "trigger-newest",
+		TriggerThreadID:       "thread-root-A",
+		TriggerCommentContent: "latest instruction",
+		TriggerAuthorType:     "member",
+		CoalescedCommentIDs:   []string{"c-old-1", "c-old-2"},
+	}
+	out := BuildPrompt(task, "claude")
+
+	if strings.Contains(out, "they are in the triggering thread") {
+		t.Errorf("id-only fallback must not assume a shared thread, got:\n%s", out)
+	}
+	if !strings.Contains(out, "--recent 30") {
+		t.Errorf("id-only fallback must point at an issue-wide fetch (--recent 30), got:\n%s", out)
+	}
+	for _, id := range []string{"c-old-1", "c-old-2"} {
+		if !strings.Contains(out, id) {
+			t.Errorf("id-only fallback must reference coalesced comment id %s, got:\n%s", id, out)
+		}
 	}
 }
