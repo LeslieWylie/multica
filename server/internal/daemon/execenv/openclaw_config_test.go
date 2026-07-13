@@ -11,7 +11,47 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
+
+// TestOpenclawCLITimeoutFromEnv covers every input openclawCLITimeoutFromEnv
+// must degrade gracefully on: this is a task-prep timeout, not a
+// correctness-critical setting, so anything other than a clean positive
+// integer falls back to the default rather than erroring or, worse,
+// resolving to a zero/negative timeout that would fail every invocation
+// immediately.
+func TestOpenclawCLITimeoutFromEnv(t *testing.T) {
+	cases := []struct {
+		name string
+		env  string // "" and unset are tested separately below
+		want time.Duration
+	}{
+		{"valid_positive", "45", 45 * time.Second},
+		{"valid_one_second", "1", time.Second},
+		{"zero_falls_back", "0", defaultOpenclawCLITimeoutSeconds * time.Second},
+		{"negative_falls_back", "-5", defaultOpenclawCLITimeoutSeconds * time.Second},
+		{"non_numeric_falls_back", "not-a-number", defaultOpenclawCLITimeoutSeconds * time.Second},
+		{"float_falls_back", "5.5", defaultOpenclawCLITimeoutSeconds * time.Second},
+		{"whitespace_only_falls_back", "   ", defaultOpenclawCLITimeoutSeconds * time.Second},
+		{"surrounding_whitespace_is_trimmed", "  20  ", 20 * time.Second},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(envOpenclawCLITimeoutSeconds, tc.env)
+			if got := openclawCLITimeoutFromEnv(); got != tc.want {
+				t.Errorf("openclawCLITimeoutFromEnv() with env=%q = %s, want %s", tc.env, got, tc.want)
+			}
+		})
+	}
+
+	t.Run("unset_falls_back_to_default", func(t *testing.T) {
+		t.Setenv(envOpenclawCLITimeoutSeconds, "")
+		os.Unsetenv(envOpenclawCLITimeoutSeconds)
+		if got := openclawCLITimeoutFromEnv(); got != defaultOpenclawCLITimeoutSeconds*time.Second {
+			t.Errorf("openclawCLITimeoutFromEnv() unset = %s, want %s", got, defaultOpenclawCLITimeoutSeconds*time.Second)
+		}
+	})
+}
 
 // openclawCLIStub captures one or more (subcommand, response) pairs and
 // installs itself into the package-level openclawExec hook for the duration
