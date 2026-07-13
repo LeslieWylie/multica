@@ -285,19 +285,23 @@ WHERE atq.id = $1 AND a.workspace_id = $2;
 -- IS NULL, so two run_only tasks for the same agent — e.g. the same webhook-triggered
 -- autopilot firing twice in quick succession — could both be claimed and executed
 -- concurrently with no serialization at all, bounded only by max_concurrent_tasks.
--- Serializes on "any other run_only-shaped task for the same agent", not on matching
--- autopilot_run_id/autopilot_id, so two DIFFERENT autopilots assigned to the same
--- agent still serialize against each other too — the same coarse-grained tradeoff
--- the quick-create branch already makes for its own shape.
+-- Serializes on matching autopilot_id (resolved via the autopilot_run join below),
+-- not on "any run_only-shaped task" — two runs of the SAME autopilot on the same
+-- agent still serialize against each other, but two DIFFERENT autopilots assigned to
+-- the same agent are allowed to run in parallel (confirmed product semantics: only
+-- same-autopilot repeats need the mutex; unrelated autopilots sharing an agent should
+-- not queue behind each other).
 UPDATE agent_task_queue
 SET status = 'dispatched',
     dispatched_at = now(),
     prepare_lease_expires_at = now() + make_interval(secs => @prepare_lease_secs::double precision)
 WHERE id = (
     SELECT atq.id FROM agent_task_queue atq
+    LEFT JOIN autopilot_run atq_run ON atq_run.id = atq.autopilot_run_id
     WHERE atq.agent_id = $1 AND atq.status = 'queued'
       AND NOT EXISTS (
           SELECT 1 FROM agent_task_queue active
+          LEFT JOIN autopilot_run active_run ON active_run.id = active.autopilot_run_id
           WHERE active.agent_id = atq.agent_id
             AND active.status IN ('dispatched', 'running', 'waiting_local_directory')
             AND (
@@ -314,16 +318,16 @@ WHERE id = (
               OR (
                 atq.issue_id IS NULL
                 AND atq.chat_session_id IS NULL
-                AND atq.autopilot_run_id IS NOT NULL
+                AND atq_run.autopilot_id IS NOT NULL
                 AND active.issue_id IS NULL
                 AND active.chat_session_id IS NULL
-                AND active.autopilot_run_id IS NOT NULL
+                AND active_run.autopilot_id = atq_run.autopilot_id
               )
             )
       )
     ORDER BY atq.priority DESC, atq.created_at ASC
     LIMIT 1
-    FOR UPDATE SKIP LOCKED
+    FOR UPDATE OF atq SKIP LOCKED
 )
 RETURNING *;
 
