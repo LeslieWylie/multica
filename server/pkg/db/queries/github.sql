@@ -84,7 +84,7 @@ INSERT INTO github_pull_request (
     $11, sqlc.narg('mergeable_state'),
     $12, $13, $14
 )
-ON CONFLICT (workspace_id, repo_owner, repo_name, pr_number) DO UPDATE SET
+ON CONFLICT (workspace_id, provider, provider_host, repo_owner, repo_name, pr_number) DO UPDATE SET
     installation_id = EXCLUDED.installation_id,
     title = EXCLUDED.title,
     state = EXCLUDED.state,
@@ -108,8 +108,15 @@ ON CONFLICT (workspace_id, repo_owner, repo_name, pr_number) DO UPDATE SET
 RETURNING *;
 
 -- name: GetGitHubPullRequest :one
+-- Filters provider='github' explicitly (migration 155 widened the identity
+-- key to include provider/provider_host so a GitHub PR and a GitLab MR can
+-- share a repo_owner/repo_name/pr_number string in one workspace) — this
+-- query is only ever called from GitHub's own check_suite webhook path
+-- (github.go), never GitLab's, so without this filter it would
+-- nondeterministically return whichever provider's row the planner picks
+-- first when both exist for the same path.
 SELECT * FROM github_pull_request
-WHERE workspace_id = $1 AND repo_owner = $2 AND repo_name = $3 AND pr_number = $4;
+WHERE workspace_id = $1 AND provider = 'github' AND repo_owner = $2 AND repo_name = $3 AND pr_number = $4;
 
 -- name: ListPullRequestsByIssue :many
 -- Returns the issue's linked PRs with the aggregated check-suite counts for
@@ -151,7 +158,7 @@ checks AS (
     GROUP BY pr_id
 )
 SELECT
-    pr.id, pr.workspace_id, pr.installation_id, pr.provider, pr.repo_owner, pr.repo_name,
+    pr.id, pr.workspace_id, pr.installation_id, pr.provider, pr.provider_host, pr.repo_owner, pr.repo_name,
     pr.pr_number, pr.title, pr.state, pr.html_url, pr.branch, pr.author_login,
     pr.author_avatar_url, pr.merged_at, pr.closed_at, pr.pr_created_at,
     pr.pr_updated_at, pr.head_sha, pr.mergeable_state,

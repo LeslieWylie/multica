@@ -3,9 +3,11 @@
 import { useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
-import { Copy, RefreshCw } from "lucide-react";
+import { Copy, Trash2 } from "lucide-react";
 import { Button } from "@multica/ui/components/ui/button";
 import { Card, CardContent } from "@multica/ui/components/ui/card";
+import { Input } from "@multica/ui/components/ui/input";
+import { Label } from "@multica/ui/components/ui/label";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -16,138 +18,144 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@multica/ui/components/ui/alert-dialog";
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogDescription,
+  DialogFooter,
+} from "@multica/ui/components/ui/dialog";
 import { useAuthStore } from "@multica/core/auth";
 import { useWorkspaceId } from "@multica/core/hooks";
 import { memberListOptions } from "@multica/core/workspace/queries";
-import { gitlabIntegrationOptions, gitlabKeys } from "@multica/core/gitlab";
+import { gitlabIntegrationsOptions, gitlabKeys } from "@multica/core/gitlab";
 import { api, ApiError } from "@multica/core/api";
+import type { GitLabIntegrationResponse } from "@multica/core/types";
 import { useT } from "../../i18n";
 import { GitLabMark } from "./gitlab-mark";
 
-// GitLabTab is the workspace settings panel for the GitLab MR ↔ issue
-// integration (see server/internal/handler/gitlab.go). Unlike GitHub's App
-// installation flow, GitLab has no OAuth/discovery step: the admin copies a
-// webhook URL from here and pastes it into the GitLab project's
-// Settings → Webhooks page, with "Merge request events" checked. There is
-// deliberately no repository list or connection status beyond
-// configured/not-configured — GitLab has no equivalent of an App
-// installation to enumerate.
+// GitLabTab is the workspace settings panel for GitLab MR ↔ issue
+// integrations. Structured like OctoTab: a workspace registers one
+// integration PER GitLab project it wants MR sync for (there's no App/
+// installation concept on GitLab's side to discover projects automatically),
+// each with its own webhook URL + secret. Listing is member-visible;
+// register/remove are admin-only (the backend enforces it via
+// RequireWorkspaceRole; the UI hides the actions to match).
 export function GitLabTab() {
   const { t } = useT("settings");
   const wsId = useWorkspaceId();
   const qc = useQueryClient();
   const user = useAuthStore((s) => s.user);
 
+  const { data: listing, isLoading } = useQuery({
+    ...gitlabIntegrationsOptions(wsId),
+    enabled: !!wsId,
+  });
   const { data: members = [] } = useQuery({
     ...memberListOptions(wsId),
     enabled: !!wsId,
   });
-  const canManage = members.some(
+
+  const isAdmin = members.some(
     (m) => m.user_id === user?.id && (m.role === "owner" || m.role === "admin"),
   );
 
-  const { data, isLoading } = useQuery({
-    ...gitlabIntegrationOptions(wsId),
-    enabled: !!wsId,
-  });
-  const configured = data?.configured === true;
+  const integrations = listing?.integrations ?? [];
 
-  const [rotating, setRotating] = useState(false);
-  const [confirmRotateOpen, setConfirmRotateOpen] = useState(false);
-  // The webhook URL is only ever returned by the rotate call, the instant the
-  // plaintext token is known — same "shown once" pattern as webhook
-  // subscriptions' signing secret (see webhook-dialogs.tsx). Held in local
-  // state rather than query cache so it disappears once the dialog closes.
-  const [webhookUrl, setWebhookUrl] = useState<string | null>(null);
+  const [configureOpen, setConfigureOpen] = useState(false);
+  const [deleteTarget, setDeleteTarget] = useState<GitLabIntegrationResponse | null>(null);
+  const [deleting, setDeleting] = useState(false);
+  // The webhook URL + secret are only ever returned by the create call, the
+  // instant the plaintext secret is known — same "shown once" pattern as
+  // webhook subscriptions' signing secret (see webhook-dialogs.tsx).
+  const [created, setCreated] = useState<{ url: string; secret: string } | null>(null);
 
-  async function copyUrl(url: string) {
+  const refresh = () => {
+    if (wsId) qc.invalidateQueries({ queryKey: gitlabKeys.integrations(wsId) });
+  };
+
+  async function copyText(text: string) {
     try {
-      await navigator.clipboard.writeText(url);
+      await navigator.clipboard.writeText(text);
       toast.success(t(($) => $.gitlab.toast_copied));
     } catch {
       toast.error(t(($) => $.gitlab.toast_copy_failed));
     }
   }
 
-  async function handleRotate() {
-    if (!wsId || rotating) return;
-    setRotating(true);
-    try {
-      const resp = await api.rotateGitLabIntegration(wsId);
-      setWebhookUrl(resp.webhook_url ?? null);
-      qc.setQueryData(gitlabKeys.integration(wsId), resp);
-      toast.success(t(($) => $.gitlab.toast_rotated));
-    } catch (e) {
-      toast.error(e instanceof ApiError ? e.message : t(($) => $.gitlab.toast_rotate_failed));
-    } finally {
-      setRotating(false);
-      setConfirmRotateOpen(false);
-    }
-  }
-
-  if (!wsId) return null;
-
   return (
     <div className="space-y-4">
-      <div>
-        <h3 className="text-sm font-medium">{t(($) => $.gitlab.section_title)}</h3>
-        <p className="text-sm text-muted-foreground">{t(($) => $.gitlab.description)}</p>
+      <div className="flex items-center justify-between">
+        <div>
+          <h3 className="text-sm font-medium">{t(($) => $.gitlab.section_title)}</h3>
+          <p className="text-sm text-muted-foreground">{t(($) => $.gitlab.description)}</p>
+        </div>
+        {isAdmin && (
+          <Button size="sm" onClick={() => setConfigureOpen(true)}>
+            {t(($) => $.gitlab.register_button)}
+          </Button>
+        )}
       </div>
 
-      <Card>
-        <CardContent className="space-y-4">
-          <div className="flex items-start justify-between gap-4">
-            <div className="flex items-start gap-3">
-              <GitLabMark className="h-6 w-6 mt-0.5 shrink-0 text-muted-foreground" />
-              <div className="space-y-1">
-                <p className="text-sm font-medium">{t(($) => $.gitlab.connection_title)}</p>
-                {isLoading ? (
-                  <p className="text-xs text-muted-foreground">{t(($) => $.gitlab.loading)}</p>
-                ) : configured ? (
-                  <p className="text-xs text-muted-foreground">
-                    {t(($) => $.gitlab.configured_description)}
-                  </p>
-                ) : canManage ? (
-                  <p className="text-xs text-muted-foreground">
-                    {t(($) => $.gitlab.not_configured_description)}
-                  </p>
-                ) : (
-                  <p className="text-xs text-muted-foreground">
-                    {t(($) => $.gitlab.contact_admin_to_connect)}
-                  </p>
-                )}
+      {isLoading && (
+        <Card>
+          <CardContent className="py-6 text-sm text-muted-foreground">
+            {t(($) => $.gitlab.loading)}
+          </CardContent>
+        </Card>
+      )}
+
+      {!isLoading && integrations.length === 0 && (
+        <Card>
+          <CardContent className="py-6 text-sm text-muted-foreground">
+            {isAdmin
+              ? t(($) => $.gitlab.empty)
+              : t(($) => $.gitlab.member_not_configured_hint)}
+          </CardContent>
+        </Card>
+      )}
+
+      {integrations.map((integ) => (
+        <Card key={integ.id}>
+          <CardContent className="flex items-center justify-between gap-4 py-4">
+            <div className="flex min-w-0 items-center gap-3">
+              <GitLabMark className="h-5 w-5 shrink-0 text-muted-foreground" />
+              <div className="min-w-0">
+                <div className="truncate text-sm font-medium">{integ.gitlab_project_path}</div>
+                <div className="truncate text-xs text-muted-foreground">{integ.gitlab_host}</div>
               </div>
             </div>
-            {canManage && (
+            {isAdmin && (
               <Button
-                variant={configured ? "outline" : "default"}
-                size="sm"
-                onClick={() => (configured ? setConfirmRotateOpen(true) : handleRotate())}
-                disabled={rotating}
+                size="icon"
+                variant="ghost"
+                aria-label={t(($) => $.gitlab.remove)}
+                onClick={() => setDeleteTarget(integ)}
               >
-                <RefreshCw className="h-3.5 w-3.5" />
-                {rotating
-                  ? t(($) => $.gitlab.rotating)
-                  : configured
-                    ? t(($) => $.gitlab.rotate_button)
-                    : t(($) => $.gitlab.generate_button)}
+                <Trash2 className="h-4 w-4" />
               </Button>
             )}
-          </div>
+          </CardContent>
+        </Card>
+      ))}
 
-          {!canManage && !configured && (
-            <p className="text-xs text-muted-foreground">
-              {t(($) => $.gitlab.member_not_configured_hint)}
-            </p>
-          )}
-        </CardContent>
-      </Card>
+      <ConfigureDialog
+        open={configureOpen}
+        onOpenChange={setConfigureOpen}
+        wsId={wsId}
+        onConfigured={(url, secret) => {
+          setConfigureOpen(false);
+          setCreated({ url, secret });
+          refresh();
+        }}
+      />
 
-      {/* Webhook-URL-shown-once dialog */}
+      {/* Webhook-URL-and-secret-shown-once dialog */}
       <AlertDialog
-        open={!!webhookUrl}
+        open={!!created}
         onOpenChange={(v) => {
-          if (!v) setWebhookUrl(null);
+          if (!v) setCreated(null);
         }}
       >
         <AlertDialogContent>
@@ -157,48 +165,188 @@ export function GitLabTab() {
               {t(($) => $.gitlab.webhook_dialog_description)}
             </AlertDialogDescription>
           </AlertDialogHeader>
-          {webhookUrl && (
-            <div className="flex items-center gap-2">
-              <code className="min-w-0 flex-1 truncate rounded bg-muted px-2 py-1.5 text-xs">
-                {webhookUrl}
-              </code>
-              <Button variant="outline" size="icon" onClick={() => copyUrl(webhookUrl)}>
-                <Copy className="h-4 w-4" />
-              </Button>
+          {created && (
+            <div className="space-y-3">
+              <div className="space-y-1">
+                <Label className="text-xs">{t(($) => $.gitlab.webhook_dialog_url_label)}</Label>
+                <div className="flex items-center gap-2">
+                  <code className="min-w-0 flex-1 truncate rounded bg-muted px-2 py-1.5 text-xs">
+                    {created.url}
+                  </code>
+                  <Button
+                    variant="outline"
+                    size="icon"
+                    onClick={() => copyText(created.url)}
+                  >
+                    <Copy className="h-4 w-4" />
+                  </Button>
+                </div>
+              </div>
+              <div className="space-y-1">
+                <Label className="text-xs">{t(($) => $.gitlab.webhook_dialog_secret_label)}</Label>
+                <div className="flex items-center gap-2">
+                  <code className="min-w-0 flex-1 truncate rounded bg-muted px-2 py-1.5 text-xs">
+                    {created.secret}
+                  </code>
+                  <Button
+                    variant="outline"
+                    size="icon"
+                    onClick={() => copyText(created.secret)}
+                  >
+                    <Copy className="h-4 w-4" />
+                  </Button>
+                </div>
+              </div>
+              <p className="text-xs text-muted-foreground">
+                {t(($) => $.gitlab.webhook_dialog_secret_hint)}
+              </p>
             </div>
           )}
-          <p className="text-xs text-muted-foreground">
-            {t(($) => $.gitlab.webhook_dialog_secret_hint)}
-          </p>
           <AlertDialogFooter>
-            <AlertDialogAction onClick={() => setWebhookUrl(null)}>
+            <AlertDialogAction onClick={() => setCreated(null)}>
               {t(($) => $.gitlab.webhook_dialog_done)}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
 
-      {/* Rotate confirmation — rotating invalidates the previous URL
-          immediately, so an admin who forgot to update the GitLab project's
-          webhook config would silently stop receiving events. */}
-      <AlertDialog open={confirmRotateOpen} onOpenChange={setConfirmRotateOpen}>
+      {/* Remove confirmation */}
+      <AlertDialog open={!!deleteTarget} onOpenChange={(o) => !o && setDeleteTarget(null)}>
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>{t(($) => $.gitlab.rotate_confirm_title)}</AlertDialogTitle>
+            <AlertDialogTitle>{t(($) => $.gitlab.remove_confirm_title)}</AlertDialogTitle>
             <AlertDialogDescription>
-              {t(($) => $.gitlab.rotate_confirm_description)}
+              {t(($) => $.gitlab.remove_confirm_description)}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
-            <AlertDialogCancel disabled={rotating}>
-              {t(($) => $.gitlab.rotate_confirm_cancel)}
+            <AlertDialogCancel disabled={deleting}>
+              {t(($) => $.gitlab.remove_confirm_cancel)}
             </AlertDialogCancel>
-            <AlertDialogAction onClick={handleRotate} disabled={rotating}>
-              {t(($) => $.gitlab.rotate_confirm_action)}
+            <AlertDialogAction
+              disabled={deleting}
+              onClick={async () => {
+                const target = deleteTarget;
+                if (!target || !wsId) return;
+                setDeleting(true);
+                try {
+                  await api.deleteGitLabIntegration(wsId, target.id);
+                  toast.success(t(($) => $.gitlab.removed));
+                  setDeleteTarget(null);
+                  refresh();
+                } catch (err) {
+                  toast.error(
+                    err instanceof ApiError ? err.message : t(($) => $.gitlab.remove_failed),
+                  );
+                } finally {
+                  setDeleting(false);
+                }
+              }}
+            >
+              {deleting ? t(($) => $.gitlab.removing) : t(($) => $.gitlab.remove_confirm_action)}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
     </div>
+  );
+}
+
+function ConfigureDialog({
+  open,
+  onOpenChange,
+  wsId,
+  onConfigured,
+}: {
+  open: boolean;
+  onOpenChange: (o: boolean) => void;
+  wsId: string;
+  onConfigured: (webhookUrl: string, webhookSecret: string) => void;
+}) {
+  const { t } = useT("settings");
+  const [host, setHost] = useState("");
+  const [projectPath, setProjectPath] = useState("");
+  const [projectId, setProjectId] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+
+  const parsedProjectId = Number(projectId);
+  const canSubmit =
+    host.trim() !== "" &&
+    projectPath.trim() !== "" &&
+    projectId.trim() !== "" &&
+    Number.isInteger(parsedProjectId) &&
+    parsedProjectId > 0;
+
+  const submit = async () => {
+    if (!canSubmit) return;
+    setSubmitting(true);
+    try {
+      const resp = await api.createGitLabIntegration(wsId, {
+        gitlab_host: host.trim(),
+        gitlab_project_path: projectPath.trim(),
+        gitlab_project_id: parsedProjectId,
+      });
+      toast.success(t(($) => $.gitlab.registered));
+      setHost("");
+      setProjectPath("");
+      setProjectId("");
+      if (resp.webhook_url && resp.webhook_secret) {
+        onConfigured(resp.webhook_url, resp.webhook_secret);
+      }
+    } catch (err) {
+      toast.error(err instanceof ApiError ? err.message : t(($) => $.gitlab.register_failed));
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>{t(($) => $.gitlab.register_button)}</DialogTitle>
+          <DialogDescription>{t(($) => $.gitlab.register_desc)}</DialogDescription>
+        </DialogHeader>
+        <div className="space-y-3">
+          <div className="space-y-1">
+            <label className="text-xs font-medium">{t(($) => $.gitlab.host_label)}</label>
+            <Input
+              value={host}
+              onChange={(e) => setHost(e.target.value)}
+              placeholder={t(($) => $.gitlab.host_placeholder)}
+            />
+          </div>
+          <div className="space-y-1">
+            <label className="text-xs font-medium">{t(($) => $.gitlab.project_path_label)}</label>
+            <Input
+              value={projectPath}
+              onChange={(e) => setProjectPath(e.target.value)}
+              placeholder={t(($) => $.gitlab.project_path_placeholder)}
+            />
+          </div>
+          <div className="space-y-1">
+            <label className="text-xs font-medium">{t(($) => $.gitlab.project_id_label)}</label>
+            <Input
+              type="number"
+              min={1}
+              value={projectId}
+              onChange={(e) => setProjectId(e.target.value)}
+              placeholder={t(($) => $.gitlab.project_id_placeholder)}
+            />
+            <p className="text-xs text-muted-foreground">
+              {t(($) => $.gitlab.project_id_hint)}
+            </p>
+          </div>
+        </div>
+        <DialogFooter>
+          <Button variant="ghost" onClick={() => onOpenChange(false)}>
+            {t(($) => $.gitlab.cancel)}
+          </Button>
+          <Button disabled={submitting || !canSubmit} onClick={submit}>
+            {submitting ? t(($) => $.gitlab.registering) : t(($) => $.gitlab.register_button)}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
 }

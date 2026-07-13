@@ -3,12 +3,12 @@ import { api } from "../api";
 
 export const gitlabKeys = {
   all: (wsId: string) => ["gitlab", wsId] as const,
-  integration: (wsId: string) => [...gitlabKeys.all(wsId), "integration"] as const,
+  integrations: (wsId: string) => [...gitlabKeys.all(wsId), "integrations"] as const,
 };
 
-export const gitlabIntegrationOptions = (wsId: string) =>
+export const gitlabIntegrationsOptions = (wsId: string) =>
   queryOptions({
-    queryKey: gitlabKeys.integration(wsId),
-    queryFn: () => api.getGitLabIntegration(wsId),
+    queryKey: gitlabKeys.integrations(wsId),
+    queryFn: () => api.listGitLabIntegrations(wsId),
     enabled: !!wsId,
   });

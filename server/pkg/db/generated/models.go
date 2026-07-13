@@ -423,6 +423,7 @@ type GithubPullRequest struct {
 	Deletions       int32              `json:"deletions"`
 	ChangedFiles    int32              `json:"changed_files"`
 	Provider        string             `json:"provider"`
+	ProviderHost    string             `json:"provider_host"`
 }
 
 type GithubPullRequestCheckSuite struct {
@@ -436,12 +437,15 @@ type GithubPullRequestCheckSuite struct {
 }
 
 type GitlabIntegration struct {
-	ID           pgtype.UUID        `json:"id"`
-	WorkspaceID  pgtype.UUID        `json:"workspace_id"`
-	WebhookToken string             `json:"webhook_token"`
-	CreatedByID  pgtype.UUID        `json:"created_by_id"`
-	CreatedAt    pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt    pgtype.Timestamptz `json:"updated_at"`
+	ID                pgtype.UUID        `json:"id"`
+	WorkspaceID       pgtype.UUID        `json:"workspace_id"`
+	GitlabHost        string             `json:"gitlab_host"`
+	GitlabProjectID   int64              `json:"gitlab_project_id"`
+	GitlabProjectPath string             `json:"gitlab_project_path"`
+	WebhookSecret     string             `json:"webhook_secret"`
+	CreatedByID       pgtype.UUID        `json:"created_by_id"`
+	CreatedAt         pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
 }
 
 type InboxItem struct {
