@@ -188,6 +188,7 @@ API 返回的 `download_url` 在未配置 CloudFront 签名时会指向 `GET /ap
 | `MULTICA_<PROVIDER>_PATH` | 对应 CLI 名 | 各 AI 编程工具的可执行文件路径（如 `MULTICA_CLAUDE_PATH`）|
 | `MULTICA_<PROVIDER>_MODEL` | 空 | 各 AI 编程工具的默认模型 |
 | `MULTICA_<PROVIDER>_ARGS` | 空 | 守护进程级的默认 CLI 参数，作用于该后端的每个任务，并排在各智能体自身的 `custom_args` 之前。支持 `MULTICA_CLAUDE_ARGS`、`MULTICA_CODEX_ARGS`、`MULTICA_CODEBUDDY_ARGS` |
+| `MULTICA_OPENCLAW_CLI_TIMEOUT_SECONDS` | `5` | 守护进程准备 OpenClaw 任务环境时，每次调用 `openclaw config ...` 的超时时间。如果任务准备在较慢的机器上或并发派发任务时报 `signal: killed`，可以调大这个值——实测单次冷启动 `openclaw` CLI 需要 2.4-4.2 秒，多个任务并发启动时超过 7 秒。未设置、空值、非数字或非正数都会回退到默认值 |
 
 完整解释每个参数对守护进程行为的影响，见 [守护进程与运行时](/daemon-runtimes)。
 
