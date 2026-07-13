@@ -108,7 +108,7 @@ describe("WebhooksSection", () => {
     expect(screen.getByText("https://hooks.acme.dev/in")).toBeTruthy();
   });
 
-  it("creates a subscription with every event checked by default", async () => {
+  it("creates a subscription with only issue.status_changed checked by default", async () => {
     mockCreate.mockResolvedValue(makeSub({ secret: "whsec_revealed" }));
     render(<WebhooksSection />, { wrapper: I18nWrapper });
 
@@ -120,14 +120,14 @@ describe("WebhooksSection", () => {
       expect(mockCreate).toHaveBeenCalledWith({
         url: "https://new.example.com/hook",
         project_id: null,
-        events: ["issue.status_changed", "issue.assigned", "comment.created"],
+        events: ["issue.status_changed"],
       }),
     );
     // Secret-once dialog surfaces the revealed secret.
     expect(await screen.findByText("whsec_revealed")).toBeTruthy();
   });
 
-  it("unchecking an event narrows what the create request subscribes to", async () => {
+  it("checking an additional event widens what the create request subscribes to", async () => {
     mockCreate.mockResolvedValue(makeSub({ secret: "whsec_revealed" }));
     render(<WebhooksSection />, { wrapper: I18nWrapper });
 
@@ -135,10 +135,11 @@ describe("WebhooksSection", () => {
       screen.getByPlaceholderText(/example\.com/i),
       "https://new.example.com/hook",
     );
-    // Checkboxes render in WEBHOOK_SUBSCRIPTION_EVENTS order: status_changed,
-    // assigned, comment.created. Uncheck the third to leave the other two.
+    // Checkboxes render in WEBHOOK_SUBSCRIPTION_EVENTS order: status_changed
+    // (checked by default), assigned, comment.created. Check the second to
+    // widen the default single-event selection.
     const checkboxes = screen.getAllByRole("checkbox");
-    await userEvent.click(checkboxes[2]!);
+    await userEvent.click(checkboxes[1]!);
     await userEvent.click(screen.getByRole("button", { name: /^Add$/i }));
 
     await waitFor(() =>
@@ -156,9 +157,9 @@ describe("WebhooksSection", () => {
       screen.getByPlaceholderText(/example\.com/i),
       "https://new.example.com/hook",
     );
-    for (const checkbox of screen.getAllByRole("checkbox")) {
-      await userEvent.click(checkbox);
-    }
+    // Only issue.status_changed is checked by default — uncheck it to empty
+    // the selection (the other two start unchecked already).
+    await userEvent.click(screen.getAllByRole("checkbox")[0]!);
     expect(screen.getByRole("button", { name: /^Add$/i })).toBeDisabled();
   });
 
