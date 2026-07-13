@@ -20,8 +20,10 @@ import (
 	"github.com/multica-ai/multica/server/internal/analytics"
 	"github.com/multica-ai/multica/server/internal/auth"
 	"github.com/multica-ai/multica/server/internal/daemonws"
+	"github.com/multica-ai/multica/server/internal/integrations/slack"
 	obsmetrics "github.com/multica-ai/multica/server/internal/metrics"
 	"github.com/multica-ai/multica/server/internal/middleware"
+	"github.com/multica-ai/multica/server/internal/runtimeapps"
 	"github.com/multica-ai/multica/server/internal/service"
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
@@ -267,6 +269,70 @@ func normalizeProvider(s string) string {
 	return strings.ToLower(strings.TrimSpace(s))
 }
 
+// inheritMachineCustomName gives a freshly-inserted runtime the machine's
+// shared custom name (MUL-4217) when the machine is already named, so adding a
+// provider — or recording a failed custom-runtime profile — on a named machine
+// doesn't leave a custom_name = NULL row that makes the machine title revert to
+// its hostname. Both the normal runtime path and the failed-profile path write
+// daemon_id-scoped rows that show up in the machine grouping, so both call this.
+//
+// Only fresh inserts with no name of their own and a daemon_id participate;
+// existing rows keep whatever they already have. A lookup/update error is
+// non-fatal — registration must still succeed — so the input row is returned
+// unchanged on any failure.
+func (h *Handler) inheritMachineCustomName(ctx context.Context, rt db.AgentRuntime, inserted bool) db.AgentRuntime {
+	if !inserted || rt.CustomName.Valid || !rt.DaemonID.Valid {
+		return rt
+	}
+	names, err := h.Queries.ListDaemonCustomNames(ctx, db.ListDaemonCustomNamesParams{
+		WorkspaceID: rt.WorkspaceID,
+		DaemonID:    rt.DaemonID,
+		ExcludeID:   rt.ID,
+	})
+	if err != nil {
+		return rt
+	}
+	shared, ok := sharedDaemonCustomName(names)
+	if !ok {
+		return rt
+	}
+	updated, err := h.Queries.UpdateAgentRuntimeCustomName(ctx, db.UpdateAgentRuntimeCustomNameParams{
+		CustomName: pgtype.Text{String: shared, Valid: true},
+		ID:         rt.ID,
+	})
+	if err != nil {
+		return rt
+	}
+	return updated
+}
+
+// sharedDaemonCustomName returns the machine-level name shared by all of a
+// daemon's runtimes — the same rule the frontend's sharedCustomName applies:
+// every runtime must carry the identical non-empty custom_name. Returns
+// ("", false) when the set is empty, any runtime is unnamed, or the names
+// disagree (i.e. there is no single machine name to inherit).
+func sharedDaemonCustomName(names []pgtype.Text) (string, bool) {
+	if len(names) == 0 {
+		return "", false
+	}
+	var first string
+	for i, n := range names {
+		if !n.Valid {
+			return "", false
+		}
+		v := strings.TrimSpace(n.String)
+		if v == "" {
+			return "", false
+		}
+		if i == 0 {
+			first = v
+		} else if v != first {
+			return "", false
+		}
+	}
+	return first, true
+}
+
 func (h *Handler) DaemonRegister(w http.ResponseWriter, r *http.Request) {
 	var req DaemonRegisterRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -407,6 +473,7 @@ func (h *Handler) DaemonRegister(w http.ResponseWriter, r *http.Request) {
 				WorkspaceID:    prow.WorkspaceID,
 				DaemonID:       prow.DaemonID,
 				Name:           prow.Name,
+				CustomName:     prow.CustomName,
 				RuntimeMode:    prow.RuntimeMode,
 				Provider:       prow.Provider,
 				Status:         prow.Status,
@@ -451,6 +518,7 @@ func (h *Handler) DaemonRegister(w http.ResponseWriter, r *http.Request) {
 				WorkspaceID:    row.WorkspaceID,
 				DaemonID:       row.DaemonID,
 				Name:           row.Name,
+				CustomName:     row.CustomName,
 				RuntimeMode:    row.RuntimeMode,
 				Provider:       row.Provider,
 				Status:         row.Status,
@@ -465,6 +533,11 @@ func (h *Handler) DaemonRegister(w http.ResponseWriter, r *http.Request) {
 				ProfileID:      row.ProfileID,
 			}
 		}
+
+		// A brand-new runtime on an already-named machine inherits the machine's
+		// shared custom name so the machine title stays stable as providers come
+		// and go (MUL-4217). Shared with the failed-profile path below.
+		registered = h.inheritMachineCustomName(r.Context(), registered, inserted)
 
 		// Inserted is false for normal daemon reconnects/upserts, so
 		// runtime_ready is a first-ready-per-runtime-row signal.
@@ -544,7 +617,7 @@ func (h *Handler) DaemonRegister(w http.ResponseWriter, r *http.Request) {
 			"runtime_profile_failure_reason":     reason,
 			"command_name":                       commandName,
 		})
-		if _, err := h.Queries.UpsertAgentRuntimeWithProfile(r.Context(), db.UpsertAgentRuntimeWithProfileParams{
+		prow, err := h.Queries.UpsertAgentRuntimeWithProfile(r.Context(), db.UpsertAgentRuntimeWithProfileParams{
 			WorkspaceID: wsUUID,
 			DaemonID:    strToText(req.DaemonID),
 			Name:        name,
@@ -555,11 +628,21 @@ func (h *Handler) DaemonRegister(w http.ResponseWriter, r *http.Request) {
 			Metadata:    metadata,
 			OwnerID:     ownerID,
 			ProfileID:   profileUUID,
-		}); err != nil {
+		})
+		if err != nil {
 			slog.Warn("failed to record runtime profile registration failure",
 				"workspace_id", req.WorkspaceID, "daemon_id", req.DaemonID,
 				"profile_id", profileID, "error", err)
+			continue
 		}
+		// Keep the failed-profile row consistent with the machine's name so it
+		// doesn't drag the machine title back to the hostname (MUL-4217).
+		h.inheritMachineCustomName(r.Context(), db.AgentRuntime{
+			ID:          prow.ID,
+			WorkspaceID: prow.WorkspaceID,
+			DaemonID:    prow.DaemonID,
+			CustomName:  prow.CustomName,
+		}, prow.Inserted)
 	}
 
 	slog.Info("daemon registered", "workspace_id", req.WorkspaceID, "daemon_id", req.DaemonID, "runtimes_count", len(resp))
@@ -907,9 +990,6 @@ func (h *Handler) DaemonHeartbeat(w http.ResponseWriter, r *http.Request) {
 	if len(ack.PendingLocalSkillImports) > 0 {
 		resp["pending_local_skill_imports"] = ack.PendingLocalSkillImports
 	}
-	if ack.FeatureFlags != nil {
-		resp["feature_flags"] = ack.FeatureFlags
-	}
 	writeJSON(w, http.StatusOK, resp)
 }
 
@@ -1023,9 +1103,6 @@ func (h *Handler) processHeartbeat(ctx context.Context, rt db.AgentRuntime, supp
 	ack := &protocol.DaemonHeartbeatAckPayload{
 		RuntimeID: runtimeID,
 		Status:    "ok",
-	}
-	if h.DaemonFeatureFlags != nil {
-		ack.FeatureFlags = h.DaemonFeatureFlags.EvaluateForRuntime(ctx, rt)
 	}
 
 	probeUpdateCtx, cancelProbeUpdate := context.WithTimeout(ctx, heartbeatHasPendingTimeout)
@@ -1228,6 +1305,22 @@ func requestHasDaemonCapability(r *http.Request, capability string) bool {
 	return false
 }
 
+func parseRuntimeConnectedAppsForClaim(raw []byte, taskID pgtype.UUID) []runtimeapps.ConnectedApp {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
+		return nil
+	}
+	var apps []runtimeapps.ConnectedApp
+	if err := json.Unmarshal(raw, &apps); err != nil {
+		slog.Warn("daemon claim: unmarshal runtime_connected_apps failed",
+			"task_id", uuidToString(taskID),
+			"error", err,
+		)
+		return nil
+	}
+	return apps
+}
+
 // ClaimTaskByRuntime atomically claims the next queued task for a runtime.
 // The response includes the agent's name and skills, fetched fresh from the DB.
 func (h *Handler) ClaimTaskByRuntime(w http.ResponseWriter, r *http.Request) {
@@ -1286,6 +1379,10 @@ func (h *Handler) ClaimTaskByRuntime(w http.ResponseWriter, r *http.Request) {
 
 	// Build response with fresh agent data (name + skills + custom_env + custom_args).
 	resp := taskToResponse(*task, runtimeWorkspaceID)
+	composioMCPEnabled := h.composioMCPAppsEnabled(r.Context())
+	if composioMCPEnabled {
+		resp.ConnectedApps = parseRuntimeConnectedAppsForClaim(task.RuntimeConnectedApps, task.ID)
+	}
 	if agent, err := h.Queries.GetAgent(r.Context(), task.AgentID); err == nil {
 		useSkillRefs := requestHasDaemonCapability(r, protocol.DaemonCapabilitySkillBundlesV1)
 		var customEnv map[string]string
@@ -1303,6 +1400,19 @@ func (h *Handler) ClaimTaskByRuntime(w http.ResponseWriter, r *http.Request) {
 		var mcpConfig json.RawMessage
 		if agent.McpConfig != nil {
 			mcpConfig = json.RawMessage(agent.McpConfig)
+		}
+		// Layer the per-task overlay (set at enqueue from the initiator
+		// user's active integrations — currently Composio) on top of the
+		// agent's saved mcp_config. Overlay wins on server-name collisions
+		// because it carries the live user-scoped session URL. Errors are
+		// logged but never fail the claim: a broken overlay must not prevent
+		// the agent from running with its base config.
+		if composioMCPEnabled && len(task.RuntimeMcpOverlay) > 0 {
+			if merged, err := mergeMCPOverlay(mcpConfig, json.RawMessage(task.RuntimeMcpOverlay)); err != nil {
+				slog.Warn("daemon claim: merge runtime_mcp_overlay failed; falling back to agent mcp_config", "task_id", uuidToString(task.ID), "error", err)
+			} else {
+				mcpConfig = merged
+			}
 		}
 		// runtime_config is stored as JSONB and may legitimately be the
 		// empty object `{}` for agents that haven't opted into any
@@ -1490,6 +1600,14 @@ func (h *Handler) ClaimTaskByRuntime(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
+		// MUL-4195: surface comments that were folded into this run while it
+		// was still queued so the daemon can steer the agent to read them all.
+		resp.CoalescedCommentIDs = uuidsToStrings(task.CoalescedCommentIds)
+		// Embed the folded comments' full detail (thread/author/created_at/
+		// content) so the prompt can address each one without assuming they
+		// share the triggering thread (MUL-4195 review should-fix #3).
+		resp.CoalescedComments = h.buildCoalescedCommentData(r.Context(), task.CoalescedCommentIds)
+
 		// Fetch the triggering comment content so the daemon can embed it
 		// directly in the agent prompt (prevents the agent from ignoring comments
 		// when stale output files exist in a reused workdir). Also surface the
@@ -1594,6 +1712,38 @@ func (h *Handler) ClaimTaskByRuntime(w http.ResponseWriter, r *http.Request) {
 			resp.WorkspaceID = uuidToString(cs.WorkspaceID)
 			resp.ChatSessionID = uuidToString(cs.ID)
 			resp.ThreadName = cs.Title
+			// An is_agent_intro session carries no user message: the agent opens
+			// the conversation by introducing itself. Flag it so the daemon builds
+			// a self-introduction prompt rather than a "reply to their message"
+			// prompt (MUL-4230). The is_agent_intro column stays true for the
+			// session's whole life, so gate the intro prompt on the session still
+			// having zero human messages — otherwise every follow-up turn after the
+			// creator replies would re-run the "introduce yourself" prompt and the
+			// agent keeps repeating the same introduction (MUL-4259).
+			if cs.IsAgentIntro {
+				if hasUser, herr := h.Queries.ChatSessionHasUserMessage(r.Context(), cs.ID); herr != nil {
+					slog.Warn("chat intro gate: has-user-message check failed",
+						"chat_session_id", uuidToString(cs.ID), "error", herr)
+				} else {
+					resp.ChatIntro = !hasUser
+				}
+			}
+			// Flag a channel-backed session so the daemon makes the agent aware
+			// it is operating inside Slack — read this conversation's history
+			// from the channel via `multica chat history` / `multica chat thread`,
+			// not from Multica (MUL-3871). Empty for a web-only chat session.
+			// ChatInThread tells the agent which command to start with: the
+			// latest trigger was a thread reply iff its reply-target thread
+			// (last_thread_id) differs from its own message id (a top-level
+			// @mention records its own ts as both).
+			if binding, berr := h.Queries.GetChannelChatSessionBindingBySession(r.Context(), db.GetChannelChatSessionBindingBySessionParams{
+				ChatSessionID: cs.ID,
+				ChannelType:   string(slack.TypeSlack),
+			}); berr == nil {
+				resp.ChatChannelType = string(slack.TypeSlack)
+				resp.ChatInThread = binding.LastThreadID.Valid && binding.LastThreadID.String != "" &&
+					binding.LastThreadID.String != binding.LastMessageID.String
+			}
 			if ws, err := h.Queries.GetWorkspace(r.Context(), cs.WorkspaceID); err == nil && ws.Repos != nil {
 				var repos []RepoData
 				if json.Unmarshal(ws.Repos, &repos) == nil && len(repos) > 0 {
@@ -2214,6 +2364,14 @@ func (h *Handler) CompleteTask(w http.ResponseWriter, r *http.Request) {
 
 	h.emitIssueExecutedOnFirstCompletion(r, task)
 
+	// MUL-4195: guarantee at-least-once processing. If a member posted a
+	// deliberate comment while this run was executing (or one was merged into
+	// it after its context was built), schedule a single follow-up so the
+	// input is never silently dropped. Loop-safe: member-authored only, capped
+	// by the existing per-(issue, agent) dedup, and terminating because the
+	// triggering comment always predates the follow-up run's started_at.
+	h.reconcileCommentsOnCompletion(r.Context(), task)
+
 	// Best-effort revoke of any agent task token minted at claim time.
 	// The token would naturally expire at the 24h watermark and is also
 	// cascaded on agent_task deletion, but eagerly deleting it on
@@ -2268,6 +2426,176 @@ func (h *Handler) emitIssueExecutedOnFirstCompletion(r *http.Request, task *db.A
 		taskContext.Provider,
 		durationMS,
 	))
+}
+
+// reconcileCommentsOnCompletion closes the at-least-once gap for member
+// comments a completing run did NOT deliver (MUL-4195).
+//
+// The merge path (mergeCommentIntoPendingTask) folds a comment into a task only
+// while it is still PRE-CLAIM (queued/deferred), so trigger_comment_id plus
+// coalesced_comment_ids is EXACTLY the set the run's claim response carried —
+// its "delivered set". Anything a member posted during this run's lifetime that
+// is NOT in that set was never delivered and must earn a follow-up.
+//
+// Anchor = created_at + delivered-set exclusion, NOT a dispatch/start timestamp
+// (MUL-4195 review round-3 must-fix). A timestamp anchor cannot tell a
+// delivered comment from an undelivered one, and there is a race it structurally
+// misses: a comment created while the task was still queued, but whose merge
+// lost the race to the daemon claiming the task (queued→dispatched) — the merge
+// then finds no pre-claim row (ErrNoRows), the enqueue path defers to reconcile,
+// yet the comment's created_at is BEFORE dispatched_at, so a dispatched_at
+// anchor would skip it and it would vanish. Anchoring on the task's own
+// created_at reaches back over the whole run, and excluding the delivered set
+// (trigger + coalesced) is what prevents re-firing comments the run actually
+// received. Together they catch the pre-dispatch merge-race comment, the
+// dispatch→start comment, and the during-run comment, while never double-firing
+// a delivered one.
+//
+// Scope + loop safety:
+//   - Only MEMBER comments qualify (agent replies / acknowledgements /
+//     self-triggers never do).
+//   - Only comments routing to THE AGENT THAT JUST RAN earn a follow-up here;
+//     an `@other-agent` comment is left to that agent's own creation-time
+//     trigger, so a completion never re-wakes an unrelated agent.
+//   - Every undelivered qualifying comment is replayed through the normal
+//     enqueue path in chronological order, so they coalesce into a SINGLE
+//     follow-up task (the first enqueues it, the rest merge in). Bounded to one
+//     run, and terminating: the follow-up's own created_at is later than all of
+//     these comments and its delivered set will contain them, so its completion
+//     finds nothing to re-schedule.
+func (h *Handler) reconcileCommentsOnCompletion(ctx context.Context, task *db.AgentTaskQueue) {
+	if task == nil || !task.IssueID.Valid || !task.AgentID.Valid || !task.CreatedAt.Valid {
+		return
+	}
+	comments, err := h.Queries.ListMemberCommentsForIssueSince(ctx, db.ListMemberCommentsForIssueSinceParams{
+		IssueID: task.IssueID,
+		Since:   task.CreatedAt,
+	})
+	if err != nil {
+		slog.Warn("reconcile comments on completion: list member comments failed",
+			"issue_id", uuidToString(task.IssueID), "task_id", uuidToString(task.ID), "error", err)
+		return
+	}
+	if len(comments) == 0 {
+		return
+	}
+	// The delivered set: everything this run's claim response actually carried.
+	// Because merges only ever touch pre-claim rows, this is exactly
+	// trigger_comment_id ∪ coalesced_comment_ids. Any member comment since the
+	// task was created that is NOT in here was never delivered to the run.
+	delivered := make(map[string]struct{}, len(task.CoalescedCommentIds)+1)
+	if task.TriggerCommentID.Valid {
+		delivered[uuidToString(task.TriggerCommentID)] = struct{}{}
+	}
+	for _, id := range task.CoalescedCommentIds {
+		if id.Valid {
+			delivered[uuidToString(id)] = struct{}{}
+		}
+	}
+	issue, err := h.Queries.GetIssue(ctx, task.IssueID)
+	if err != nil {
+		slog.Warn("reconcile comments on completion: load issue failed",
+			"issue_id", uuidToString(task.IssueID), "error", err)
+		return
+	}
+	agentID := uuidToString(task.AgentID)
+	scheduled := 0
+	for i := range comments {
+		c := comments[i]
+		if _, ok := delivered[uuidToString(c.ID)]; ok {
+			// Already delivered to this run (trigger or pre-claim coalesced).
+			continue
+		}
+		if isNoteComment(c.Content) {
+			continue
+		}
+		var parentComment *db.Comment
+		if c.ParentID.Valid {
+			if parent, err := h.Queries.GetComment(ctx, c.ParentID); err == nil {
+				parentComment = &parent
+			}
+		}
+		// Members are their own originator. Compute what this comment would
+		// trigger, then keep ONLY the agent that just completed — never the
+		// full fan-out (that would re-wake unrelated `@other-agent` targets).
+		actorID := uuidToString(c.AuthorID)
+		triggers := h.computeCommentAgentTriggers(ctx, issue, c.Content, parentComment, "member", actorID, commentTriggerComputeOptions{
+			ExcludeTriggerCommentID: c.ID,
+			OriginatorUserID:        actorID,
+		})
+		scoped := make([]commentAgentTrigger, 0, 1)
+		for _, trigger := range triggers {
+			if uuidToString(trigger.Agent.ID) == agentID {
+				scoped = append(scoped, trigger)
+			}
+		}
+		if len(scoped) == 0 {
+			continue
+		}
+		// The first qualifying comment enqueues the follow-up task; later ones
+		// find it AlreadyPending and merge in, so all undelivered comments end
+		// up covered by a single bounded run.
+		h.enqueueCommentAgentTriggers(ctx, issue, c.ID, scoped)
+		scheduled++
+	}
+	if scheduled > 0 {
+		slog.Info("reconcile comments on completion: scheduled follow-up",
+			"issue_id", uuidToString(task.IssueID),
+			"completed_task_id", uuidToString(task.ID),
+			"agent_id", agentID,
+			"undelivered_member_comments", scheduled)
+	}
+}
+
+// buildCoalescedCommentData loads the full detail of each comment that was
+// folded into a not-yet-started run (MUL-4195) so the claim response can embed
+// them and the prompt can address each without assuming they share the
+// triggering thread (review should-fix #3). Thread id follows the same rule as
+// the triggering comment (parent id when the comment is a reply, else the
+// comment's own id). Missing comments (deleted / wrong workspace) are skipped
+// rather than failing the claim. The set is bounded by how many comments a user
+// fires before a run starts, so the per-comment lookups stay cheap.
+func (h *Handler) buildCoalescedCommentData(ctx context.Context, ids []pgtype.UUID) []CoalescedCommentData {
+	if len(ids) == 0 {
+		return nil
+	}
+	out := make([]CoalescedCommentData, 0, len(ids))
+	for _, id := range ids {
+		if !id.Valid {
+			continue
+		}
+		comment, err := h.Queries.GetComment(ctx, id)
+		if err != nil {
+			continue
+		}
+		data := CoalescedCommentData{
+			ID:         uuidToString(comment.ID),
+			ThreadID:   uuidToString(comment.ID),
+			AuthorType: comment.AuthorType,
+			Content:    comment.Content,
+			CreatedAt:  timestampToString(comment.CreatedAt),
+		}
+		if comment.ParentID.Valid {
+			data.ThreadID = uuidToString(comment.ParentID)
+		}
+		if comment.AuthorID.Valid {
+			switch comment.AuthorType {
+			case "agent":
+				if a, err := h.Queries.GetAgent(ctx, comment.AuthorID); err == nil {
+					data.AuthorName = a.Name
+				}
+			case "member":
+				if u, err := h.Queries.GetUser(ctx, comment.AuthorID); err == nil {
+					data.AuthorName = u.Name
+				}
+			}
+		}
+		out = append(out, data)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // ReportTaskUsage stores per-task token usage. Called independently of
@@ -2331,6 +2659,24 @@ func (h *Handler) ReportTaskUsage(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		h.TaskService.CaptureTaskUsage(r.Context(), task, provider, u.Model, u.InputTokens, u.OutputTokens, u.CacheReadTokens, u.CacheWriteTokens)
+
+		// Surface prompt-cache effectiveness per run so cache hit rates are
+		// observable in logs, not just queryable from runtime_usage. The ratio
+		// is cached input over total input-side tokens; a persistently low
+		// value flags a prompt prefix that is not being reused across runs
+		// (e.g. volatile values poisoning the cacheable prefix). MUL-3887.
+		if totalInput := u.InputTokens + u.CacheReadTokens + u.CacheWriteTokens; totalInput > 0 {
+			slog.Info("task prompt-cache usage",
+				"task_id", taskID,
+				"provider", provider,
+				"model", u.Model,
+				"input_tokens", u.InputTokens,
+				"output_tokens", u.OutputTokens,
+				"cache_read_tokens", u.CacheReadTokens,
+				"cache_write_tokens", u.CacheWriteTokens,
+				"cache_read_ratio", float64(u.CacheReadTokens)/float64(totalInput),
+			)
+		}
 	}
 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})

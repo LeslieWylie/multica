@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/netip"
+	"strconv"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -20,10 +21,11 @@ import (
 	"github.com/multica-ai/multica/server/internal/cloudruntime"
 	"github.com/multica-ai/multica/server/internal/daemonws"
 	"github.com/multica-ai/multica/server/internal/events"
-	"github.com/multica-ai/multica/server/internal/featureflagdispatch"
 	"github.com/multica-ai/multica/server/internal/integrations/channel/engine"
+	composio "github.com/multica-ai/multica/server/internal/integrations/composio"
 	"github.com/multica-ai/multica/server/internal/integrations/lark"
 	"github.com/multica-ai/multica/server/internal/integrations/octo"
+	"github.com/multica-ai/multica/server/internal/integrations/slack"
 	obsmetrics "github.com/multica-ai/multica/server/internal/metrics"
 	"github.com/multica-ai/multica/server/internal/middleware"
 	"github.com/multica-ai/multica/server/internal/realtime"
@@ -31,6 +33,8 @@ import (
 	"github.com/multica-ai/multica/server/internal/storage"
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
+	"github.com/multica-ai/multica/server/pkg/featureflag"
+	"github.com/multica-ai/multica/server/pkg/llm"
 )
 
 // randomID returns a random 16-byte hex string used as a request ID for
@@ -92,6 +96,16 @@ type Config struct {
 	// frontend/CORS origin allowlist so split app/api self-hosted deployments
 	// can frame API-hosted PDFs without allowing arbitrary third-party frames.
 	AttachmentFrameAncestors []string
+	// LLM* configure the basic LLM API layer (MUL-4238). They back the
+	// OpenAI-compatible chat-completions endpoints and any internal one-shot
+	// LLM helpers. When both LLMAPIKey and LLMBaseURL are empty the layer is
+	// disabled and the endpoints return 503.
+	//   - LLMAPIKey       -> MULTICA_LLM_API_KEY
+	//   - LLMBaseURL       -> MULTICA_LLM_BASE_URL (OpenAI or any compatible gateway)
+	//   - LLMDefaultModel  -> MULTICA_LLM_DEFAULT_MODEL (used when a request omits `model`)
+	LLMAPIKey       string
+	LLMBaseURL      string
+	LLMDefaultModel string
 }
 
 type cloudRuntimeProxy interface {
@@ -119,7 +133,7 @@ type Handler struct {
 	ModelListStore        ModelListStore
 	LocalSkillListStore   LocalSkillListStore
 	LocalSkillImportStore LocalSkillImportStore
-	DaemonFeatureFlags    *featureflagdispatch.Evaluator
+	FeatureFlags          *featureflag.Service
 	LivenessStore         LivenessStore
 	HeartbeatScheduler    HeartbeatScheduler
 	Storage               storage.Storage
@@ -158,6 +172,10 @@ type Handler struct {
 	// UI consults IsConfigured() to decide whether to surface install
 	// entry points.
 	LarkAPIClient lark.APIClient
+	// Composio integration (MUL-3720). Nil when COMPOSIO_API_KEY is unset;
+	// the composio HTTP handlers return 503 in that case. Wired in
+	// cmd/server/router.go after handler.New.
+	Composio *composio.Service
 	// ChannelSupervisor owns the per-installation supervisor goroutines
 	// that hold the §4.4 WS lease and drive each channel.Channel
 	// (MUL-3620 generalized the Feishu-only Hub into this channel-agnostic
@@ -179,10 +197,10 @@ type Handler struct {
 	ChannelRouter *engine.Router
 	// Octo IM integration. Nil when MULTICA_OCTO_SECRET_KEY is unset; the
 	// HTTP handlers return 503 in that case. Wired in router.go after
-	// handler.New. OctoHub is constructed by the router but started by main.go.
+	// handler.New. Octo runs on the shared ChannelSupervisor / ChannelRouter
+	// (registered in router.go), so there is no separate hub to start.
 	OctoInstallations *octo.InstallationService
 	OctoBindingTokens *octo.BindingTokenService
-	OctoHub           *octo.Hub
 	// OctoAPIBaseURL is the default Octo REST base (MULTICA_OCTO_API_URL),
 	// used by CreateOctoInstallation when the request omits api_url.
 	OctoAPIBaseURL string
@@ -190,7 +208,26 @@ type Handler struct {
 	// redeliver handler returns 503 when unset. Assigned in main.go after the
 	// dispatcher is constructed (the field is read at request time).
 	WebhookDispatcher WebhookRedeliverer
-	cfg               Config
+	// SlackInstall owns the bring-your-own-app Slack install lifecycle (register
+	// pasted tokens / list / revoke) and the at-rest encryption of each app's bot
+	// + app tokens (MUL-3666). Nil unless MULTICA_SLACK_SECRET_KEY is set.
+	SlackInstall *slack.InstallService
+	// SlackBindingTokens mints/redeems the user-binding tokens behind the
+	// "link your Slack account" prompt (MUL-3666). Nil unless Slack is
+	// configured (MULTICA_SLACK_SECRET_KEY set).
+	SlackBindingTokens *slack.BindingTokenService
+	// SlackHistory backs the agent-facing `multica chat history` command: it
+	// reads a chat session's bound Slack conversation on demand (MUL-3871). Nil
+	// unless Slack is configured; GetChatChannelHistory then reports "no channel
+	// integration". A future platform satisfies the same reader interface.
+	SlackHistory ChatChannelHistoryReader
+	// LLM is the basic LLM API layer (MUL-4238): a thin wrapper over the
+	// OpenAI Go SDK backing the OpenAI-compatible chat-completions endpoints
+	// and any internal one-shot LLM helpers. Always non-nil (New builds it
+	// from Config); when unconfigured its Enabled() reports false and the
+	// handlers return 503.
+	LLM *llm.Client
+	cfg Config
 }
 
 // WebhookRedeliverer re-POSTs a stored outbound webhook payload to a
@@ -260,14 +297,33 @@ func New(queries *db.Queries, txStarter txStarter, hub *realtime.Hub, bus *event
 			BaseURL: cfg.CloudRuntimeFleetURL,
 			Timeout: cfg.CloudRuntimeFleetTimeout,
 		}),
+		LLM: llm.New(llm.Config{
+			APIKey:       cfg.LLMAPIKey,
+			BaseURL:      cfg.LLMBaseURL,
+			DefaultModel: cfg.LLMDefaultModel,
+		}),
 		cfg: cfg,
 	}
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
+	// Marshal the body up front so we can advertise an accurate Content-Length
+	// header. Streaming straight into the ResponseWriter after WriteHeader forces
+	// net/http into chunked transfer encoding, which omits Content-Length; buffering
+	// first lets clients (and proxies) see the exact body size.
+	body, err := json.Marshal(v)
+	if err != nil {
+		// Fall back to a minimal, self-describing error payload rather than leaving
+		// the client with a half-written response.
+		body = []byte(`{"error":"failed to encode response"}`)
+		status = http.StatusInternalServerError
+	}
+	// Match the trailing newline that json.Encoder.Encode historically appended.
+	body = append(body, '\n')
 	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(v)
+	_, _ = w.Write(body)
 }
 
 // writeMeasuredJSON behaves like writeJSON but returns the encoded body size so
@@ -281,6 +337,7 @@ func writeMeasuredJSON(w http.ResponseWriter, status int, v any) (int, error) {
 	}
 	body = append(body, '\n')
 	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 	w.WriteHeader(status)
 	if _, err := w.Write(body); err != nil {
 		return len(body), err
@@ -313,9 +370,29 @@ func timestampToString(t pgtype.Timestamptz) string { return util.TimestampToStr
 func timestampToPtr(t pgtype.Timestamptz) *string   { return util.TimestampToPtr(t) }
 func dateToPtr(d pgtype.Date) *string               { return util.DateToPtr(d) }
 func uuidToPtr(u pgtype.UUID) *string               { return util.UUIDToPtr(u) }
-func int8ToPtr(v pgtype.Int8) *int64                { return util.Int8ToPtr(v) }
-func int4ToPtr(v pgtype.Int4) *int32                { return util.Int4ToPtr(v) }
-func ptrToInt4(v *int32) pgtype.Int4                { return util.PtrToInt4(v) }
+
+// uuidsToStrings maps a UUID array column to string ids, skipping NULL/invalid
+// entries. Returns nil (not an empty slice) when there is nothing to emit so
+// `omitempty` JSON fields drop out cleanly (MUL-4195).
+func uuidsToStrings(us []pgtype.UUID) []string {
+	if len(us) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(us))
+	for _, u := range us {
+		if u.Valid {
+			out = append(out, uuidToString(u))
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func int8ToPtr(v pgtype.Int8) *int64 { return util.Int8ToPtr(v) }
+func int4ToPtr(v pgtype.Int4) *int32 { return util.Int4ToPtr(v) }
+func ptrToInt4(v *int32) pgtype.Int4 { return util.PtrToInt4(v) }
 
 // parseUUIDOrBadRequest validates a UUID string sourced from user input
 // (URL params, request body, headers). On invalid input it writes a 400
