@@ -74,3 +74,19 @@ END $$;
 ALTER TABLE github_pull_request
     ADD CONSTRAINT github_pull_request_identity_key
     UNIQUE (workspace_id, provider, provider_host, repo_owner, repo_name, pr_number);
+
+-- repo_owner/repo_name come from GitLab's path_with_namespace, which an
+-- admin can rename at any time — the identity_key above would then treat a
+-- renamed project's next webhook as a brand-new MR row instead of updating
+-- the existing one, leaving a stale duplicate that can block
+-- close-aggregate from ever reaching zero open MRs. provider_project_id
+-- carries GitLab's numeric project id (stable across renames, already
+-- validated against every inbound webhook — see gitlab_integration above)
+-- so GitLab's upsert can target this instead. Nullable + partial: GitHub
+-- rows never populate it and keep matching on the path-based key above.
+ALTER TABLE github_pull_request
+    ADD COLUMN provider_project_id BIGINT;
+
+CREATE UNIQUE INDEX github_pull_request_stable_identity_key
+    ON github_pull_request (workspace_id, provider, provider_host, provider_project_id, pr_number)
+    WHERE provider_project_id IS NOT NULL;

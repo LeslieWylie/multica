@@ -345,6 +345,77 @@ func TestGitLabWebhook_PushUpdatesHeadSha(t *testing.T) {
 	}
 }
 
+// TestGitLabWebhook_ProjectRenameUpdatesExistingRow covers the identity-key
+// fix: repo_owner/repo_name come from path_with_namespace, which GitLab lets
+// an admin rename at any time, but the MR's true identity is
+// (provider, provider_host, gitlab_project_id, iid) — the numeric project id
+// is stable across renames (see migration 155). A rename delivery for the
+// same MR must update the existing github_pull_request row's path columns,
+// not insert a second row under the new path; a stale second row would sit
+// there forever and could permanently block GetIssuePullRequestCloseAggregate
+// from ever reaching zero open MRs for the issue.
+func TestGitLabWebhook_ProjectRenameUpdatesExistingRow(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("handler test fixture not initialized (no DB?)")
+	}
+	ctx := context.Background()
+	created, integ, secret := setupGitLabTestIssue(t, ctx)
+
+	fireMergeRequestWebhook(t, uuidToString(integ.ID), secret, mrPayloadOpts{
+		projectID:    integ.GitlabProjectID,
+		projectPath:  integ.GitlabProjectPath, // "acme/gitlab-repo-a"
+		iid:          1,
+		title:        "Fix " + created.Identifier,
+		state:        "opened",
+		action:       "open",
+		sourceBranch: "fix/" + created.Identifier,
+		lastCommitID: "beforerename1112223334445556667778889990",
+	})
+
+	// The registered integration itself still points at the old path (a
+	// real rename would also re-register/update the integration row, which
+	// is orthogonal to this test), but GitLab's webhook payload now reports
+	// the project under its new path with the SAME numeric project id and
+	// the SAME MR iid — exactly what a real rename delivery looks like.
+	renamedPath := "platform/gitlab-repo-a"
+	fireMergeRequestWebhook(t, uuidToString(integ.ID), secret, mrPayloadOpts{
+		projectID:    integ.GitlabProjectID,
+		projectPath:  renamedPath,
+		iid:          1,
+		title:        "Fix " + created.Identifier,
+		state:        "opened",
+		action:       "update",
+		sourceBranch: "fix/" + created.Identifier,
+		lastCommitID: "afterrename22233344455566677788899900011",
+	})
+
+	rows, err := testHandler.Queries.ListPullRequestsByIssue(ctx, parseUUID(created.ID))
+	if err != nil {
+		t.Fatalf("ListPullRequestsByIssue: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("expected exactly 1 MR row after a rename delivery, got %d (rename produced a stale duplicate)", len(rows))
+	}
+	row := rows[0]
+	if row.RepoOwner != "platform" || row.RepoName != "gitlab-repo-a" {
+		t.Errorf("repo_owner/repo_name = %q/%q, want the renamed path platform/gitlab-repo-a", row.RepoOwner, row.RepoName)
+	}
+	if row.HeadSha != "afterrename22233344455566677788899900011" {
+		t.Errorf("head_sha = %q, want the post-rename delivery's last_commit.id (row wasn't actually updated)", row.HeadSha)
+	}
+
+	var count int
+	if err := testPool.QueryRow(ctx,
+		`SELECT count(*) FROM github_pull_request WHERE workspace_id = $1 AND provider = 'gitlab' AND pr_number = 1`,
+		testWorkspaceID,
+	).Scan(&count); err != nil {
+		t.Fatalf("count query: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("expected exactly 1 github_pull_request row for this MR, found %d", count)
+	}
+}
+
 // TestGitLabWebhook_MergedAdvancesIssueToDone covers the auto-close path:
 // once every linked MR is either merged (with closing intent from the
 // title) or otherwise no longer open, the issue advances to done, tagged
@@ -544,6 +615,83 @@ func TestGitLabWebhook_MalformedPayloadRejected(t *testing.T) {
 	}
 }
 
+// TestLookupIssueByIdentifierErr_DistinguishesQueryErrorFromNotFound covers
+// the fix for lookupIssueByIdentifier silently collapsing every
+// GetIssueByNumber failure (including a dropped connection or a canceled
+// context, not just "no such issue") into ok=false. GitLab's webhook path
+// needs the distinction — treating a transient failure as "not found" would
+// silently drop the MR-issue link with no retry, even though
+// handleMergeRequestEvent's docstring promises DB errors propagate.
+func TestLookupIssueByIdentifierErr_DistinguishesQueryErrorFromNotFound(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("handler test fixture not initialized (no DB?)")
+	}
+	ctx := context.Background()
+
+	// A genuinely nonexistent identifier: not found, no error — this is
+	// the ordinary "MR title doesn't reference an issue" case and must not
+	// be treated as a query failure.
+	_, ok, err := testHandler.lookupIssueByIdentifierErr(ctx, parseUUID(testWorkspaceID), "NOPE", "NOPE-999999")
+	if err != nil {
+		t.Fatalf("expected no error for a genuinely missing issue, got %v", err)
+	}
+	if ok {
+		t.Fatal("expected ok=false for a nonexistent issue number")
+	}
+
+	// A canceled context forces GetIssueByNumber to fail with something
+	// other than pgx.ErrNoRows — this must surface as a non-nil error, not
+	// get folded into ok=false like the "not found" case above.
+	canceledCtx, cancel := context.WithCancel(ctx)
+	cancel()
+	_, ok, err = testHandler.lookupIssueByIdentifierErr(canceledCtx, parseUUID(testWorkspaceID), "NOPE", "NOPE-1")
+	if err == nil {
+		t.Fatal("expected a query error from a canceled context, got nil")
+	}
+	if ok {
+		t.Error("ok should be false alongside a non-nil error")
+	}
+}
+
+// TestAdvanceIssueToDone_ReturnsErrorOnUpdateFailure covers the other
+// swallow path the review flagged: advanceIssueToDone previously only
+// slog.Warn'd on UpdateIssueStatus failure and returned nothing, so
+// gitlab.go's caller had no way to know the issue never actually advanced.
+// A workspace_id that doesn't match the issue's real workspace makes
+// UpdateIssueStatus's WHERE clause match zero rows — a real, deterministic
+// pgx.ErrNoRows — without needing fault-injection machinery.
+func TestAdvanceIssueToDone_ReturnsErrorOnUpdateFailure(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("handler test fixture not initialized (no DB?)")
+	}
+	ctx := context.Background()
+	created, _, _ := setupGitLabTestIssue(t, ctx)
+	issue, err := testHandler.Queries.GetIssue(ctx, parseUUID(created.ID))
+	if err != nil {
+		t.Fatalf("GetIssue: %v", err)
+	}
+
+	// advanceIssueToDone scopes UpdateIssueStatus by issue.WorkspaceID (not
+	// the workspaceID string param, which is only used for the broadcast
+	// payload) — mutate that field on a copy so the WHERE clause matches
+	// zero rows, forcing a real, deterministic pgx.ErrNoRows.
+	wrongWorkspaceID := parseUUID("00000000-0000-0000-0000-000000000abc")
+	brokenIssue := issue
+	brokenIssue.WorkspaceID = wrongWorkspaceID
+
+	if err := testHandler.advanceIssueToDone(ctx, brokenIssue, uuidToString(wrongWorkspaceID), "gitlab_mr_merged"); err == nil {
+		t.Fatal("expected advanceIssueToDone to return an error when UpdateIssueStatus matches zero rows, got nil")
+	}
+
+	reloaded, err := testHandler.Queries.GetIssue(ctx, parseUUID(created.ID))
+	if err != nil {
+		t.Fatalf("GetIssue (reload): %v", err)
+	}
+	if reloaded.Status == "done" {
+		t.Error("issue should not have advanced to done when the update itself failed")
+	}
+}
+
 // TestHandleMergeRequestEvent_UpsertFailurePropagatesError covers the core
 // of the 202-swallows-everything fix: when the MR upsert itself fails,
 // handleMergeRequestEvent must return a non-nil error (so the HTTP layer
@@ -627,17 +775,18 @@ func TestGitHubAndGitLabSamePathDoNotCollide(t *testing.T) {
 	}
 
 	gitlabMR, err := testHandler.Queries.UpsertGitLabMergeRequest(ctx, db.UpsertGitLabMergeRequestParams{
-		WorkspaceID:  wsUUID,
-		ProviderHost: "gitlab.example",
-		RepoOwner:    "acme",
-		RepoName:     "shared-name",
-		PrNumber:     12,
-		Title:        "gitlab mr",
-		State:        "open",
-		HtmlUrl:      "https://gitlab.example/acme/shared-name/-/merge_requests/12",
-		PrCreatedAt:  parseGitLabTime("2026-01-01T00:00:00Z"),
-		PrUpdatedAt:  parseGitLabTime("2026-01-01T00:00:00Z"),
-		HeadSha:      "def456",
+		WorkspaceID:       wsUUID,
+		ProviderHost:      "gitlab.example",
+		ProviderProjectID: pgtype.Int8{Int64: 9999, Valid: true},
+		RepoOwner:         "acme",
+		RepoName:          "shared-name",
+		PrNumber:          12,
+		Title:             "gitlab mr",
+		State:             "open",
+		HtmlUrl:           "https://gitlab.example/acme/shared-name/-/merge_requests/12",
+		PrCreatedAt:       parseGitLabTime("2026-01-01T00:00:00Z"),
+		PrUpdatedAt:       parseGitLabTime("2026-01-01T00:00:00Z"),
+		HeadSha:           "def456",
 	})
 	if err != nil {
 		t.Fatalf("UpsertGitLabMergeRequest: %v", err)

@@ -978,7 +978,10 @@ func (h *Handler) handlePullRequestEvent(ctx context.Context, body []byte) {
 					continue
 				}
 				if counts.OpenCount == 0 && counts.MergedWithCloseIntentCount > 0 {
-					h.advanceIssueToDone(ctx, issue, workspaceID, "github_pr_merged")
+					// Error already logged inside advanceIssueToDone; GitHub's
+					// webhook path is unconditionally 202 (see this function's
+					// caller), so there is no retry signal to feed it into.
+					_ = h.advanceIssueToDone(ctx, issue, workspaceID, "github_pr_merged")
 				}
 			}
 		}
@@ -1415,35 +1418,57 @@ func (h *Handler) workspaceAutoLinkPRsEnabled(ctx context.Context, workspaceID p
 }
 
 // the workspace's configured prefix and the number resolves to a real issue.
+// Any GetIssueByNumber error, including a transient one, is treated as
+// "not found" — GitHub's webhook path already returns 202 unconditionally
+// (see handlePullRequestEvent), so there is no retry path that a distinct
+// error return would feed into here.
 func (h *Handler) lookupIssueByIdentifier(ctx context.Context, workspaceID pgtype.UUID, prefix, identifier string) (db.Issue, bool) {
+	issue, ok, _ := h.lookupIssueByIdentifierErr(ctx, workspaceID, prefix, identifier)
+	return issue, ok
+}
+
+// lookupIssueByIdentifierErr is lookupIssueByIdentifier but distinguishes a
+// genuine "no such issue" from a query error (dropped connection, pool
+// exhaustion, etc). GitLab's webhook path (gitlab.go) needs that distinction
+// so it can propagate the latter into a 5xx and let GitLab retry, instead of
+// silently treating a transient DB failure as "this identifier doesn't
+// exist" and permanently dropping the MR-issue link.
+func (h *Handler) lookupIssueByIdentifierErr(ctx context.Context, workspaceID pgtype.UUID, prefix, identifier string) (db.Issue, bool, error) {
 	idx := strings.LastIndex(identifier, "-")
 	if idx < 0 {
-		return db.Issue{}, false
+		return db.Issue{}, false, nil
 	}
 	gotPrefix, numStr := identifier[:idx], identifier[idx+1:]
 	if !strings.EqualFold(gotPrefix, prefix) {
-		return db.Issue{}, false
+		return db.Issue{}, false, nil
 	}
 	n, err := strconv.Atoi(numStr)
 	if err != nil {
-		return db.Issue{}, false
+		return db.Issue{}, false, nil
 	}
 	issue, err := h.Queries.GetIssueByNumber(ctx, db.GetIssueByNumberParams{
 		WorkspaceID: workspaceID,
 		Number:      int32(n),
 	})
 	if err != nil {
-		return db.Issue{}, false
+		if isNotFound(err) {
+			return db.Issue{}, false, nil
+		}
+		return db.Issue{}, false, err
 	}
-	return issue, true
+	return issue, true, nil
 }
 
 // advanceIssueToDone marks issue done because a linked PR/MR merged with
 // closing intent. source is the caller-specific `issue:updated` broadcast
 // tag (e.g. "github_pr_merged", "gitlab_mr_merged") — kept as a parameter
 // rather than hardcoded so this single implementation stays accurate for
-// every provider that reuses it.
-func (h *Handler) advanceIssueToDone(ctx context.Context, issue db.Issue, workspaceID, source string) {
+// every provider that reuses it. The error return exists for GitLab's
+// caller, which propagates it into a 5xx so GitLab retries a transient
+// failure instead of leaving the issue stuck in_progress forever; GitHub's
+// caller still discards it (GitHub's webhook path is unconditionally 202,
+// per the existing pattern in handlePullRequestEvent).
+func (h *Handler) advanceIssueToDone(ctx context.Context, issue db.Issue, workspaceID, source string) error {
 	updated, err := h.Queries.UpdateIssueStatus(ctx, db.UpdateIssueStatusParams{
 		ID:          issue.ID,
 		Status:      "done",
@@ -1451,7 +1476,7 @@ func (h *Handler) advanceIssueToDone(ctx context.Context, issue db.Issue, worksp
 	})
 	if err != nil {
 		slog.Warn("advance issue to done failed", "err", err, "source", source)
-		return
+		return fmt.Errorf("update issue status: %w", err)
 	}
 
 	// Fire the platform parent-notification path on the same transition the
@@ -1472,6 +1497,7 @@ func (h *Handler) advanceIssueToDone(ctx context.Context, issue db.Issue, worksp
 		"creator_id":     uuidToString(issue.CreatorID),
 		"source":         source,
 	})
+	return nil
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
