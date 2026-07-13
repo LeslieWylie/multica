@@ -159,17 +159,21 @@ func (q *Queries) ListGitLabIntegrationsByWorkspace(ctx context.Context, workspa
 const upsertGitLabMergeRequest = `-- name: UpsertGitLabMergeRequest :one
 
 INSERT INTO github_pull_request (
-    workspace_id, installation_id, provider, provider_host, repo_owner, repo_name, pr_number,
+    workspace_id, installation_id, provider, provider_host, provider_project_id, repo_owner, repo_name, pr_number,
     title, state, html_url, branch, author_login, author_avatar_url,
     merged_at, closed_at, pr_created_at, pr_updated_at,
     head_sha, mergeable_state
 ) VALUES (
-    $1, NULL, 'gitlab', $2, $3, $4, $5,
-    $6, $7, $8, $12, $13, $14,
-    $15, $16, $9, $10,
-    $11, $17
+    $1, NULL, 'gitlab', $2, $3, $4, $5, $6,
+    $7, $8, $9, $13, $14, $15,
+    $16, $17, $10, $11,
+    $12, $18
 )
-ON CONFLICT (workspace_id, provider, provider_host, repo_owner, repo_name, pr_number) DO UPDATE SET
+ON CONFLICT (workspace_id, provider, provider_host, provider_project_id, pr_number)
+    WHERE provider_project_id IS NOT NULL
+    DO UPDATE SET
+    repo_owner = EXCLUDED.repo_owner,
+    repo_name = EXCLUDED.repo_name,
     title = EXCLUDED.title,
     state = EXCLUDED.state,
     html_url = EXCLUDED.html_url,
@@ -182,46 +186,52 @@ ON CONFLICT (workspace_id, provider, provider_host, repo_owner, repo_name, pr_nu
     head_sha = EXCLUDED.head_sha,
     mergeable_state = EXCLUDED.mergeable_state,
     updated_at = now()
-RETURNING id, workspace_id, installation_id, repo_owner, repo_name, pr_number, title, state, html_url, branch, author_login, author_avatar_url, merged_at, closed_at, pr_created_at, pr_updated_at, created_at, updated_at, head_sha, mergeable_state, additions, deletions, changed_files, provider, provider_host
+RETURNING id, workspace_id, installation_id, repo_owner, repo_name, pr_number, title, state, html_url, branch, author_login, author_avatar_url, merged_at, closed_at, pr_created_at, pr_updated_at, created_at, updated_at, head_sha, mergeable_state, additions, deletions, changed_files, provider, provider_host, provider_project_id
 `
 
 type UpsertGitLabMergeRequestParams struct {
-	WorkspaceID     pgtype.UUID        `json:"workspace_id"`
-	ProviderHost    string             `json:"provider_host"`
-	RepoOwner       string             `json:"repo_owner"`
-	RepoName        string             `json:"repo_name"`
-	PrNumber        int32              `json:"pr_number"`
-	Title           string             `json:"title"`
-	State           string             `json:"state"`
-	HtmlUrl         string             `json:"html_url"`
-	PrCreatedAt     pgtype.Timestamptz `json:"pr_created_at"`
-	PrUpdatedAt     pgtype.Timestamptz `json:"pr_updated_at"`
-	HeadSha         string             `json:"head_sha"`
-	Branch          pgtype.Text        `json:"branch"`
-	AuthorLogin     pgtype.Text        `json:"author_login"`
-	AuthorAvatarUrl pgtype.Text        `json:"author_avatar_url"`
-	MergedAt        pgtype.Timestamptz `json:"merged_at"`
-	ClosedAt        pgtype.Timestamptz `json:"closed_at"`
-	MergeableState  pgtype.Text        `json:"mergeable_state"`
+	WorkspaceID       pgtype.UUID        `json:"workspace_id"`
+	ProviderHost      string             `json:"provider_host"`
+	ProviderProjectID pgtype.Int8        `json:"provider_project_id"`
+	RepoOwner         string             `json:"repo_owner"`
+	RepoName          string             `json:"repo_name"`
+	PrNumber          int32              `json:"pr_number"`
+	Title             string             `json:"title"`
+	State             string             `json:"state"`
+	HtmlUrl           string             `json:"html_url"`
+	PrCreatedAt       pgtype.Timestamptz `json:"pr_created_at"`
+	PrUpdatedAt       pgtype.Timestamptz `json:"pr_updated_at"`
+	HeadSha           string             `json:"head_sha"`
+	Branch            pgtype.Text        `json:"branch"`
+	AuthorLogin       pgtype.Text        `json:"author_login"`
+	AuthorAvatarUrl   pgtype.Text        `json:"author_avatar_url"`
+	MergedAt          pgtype.Timestamptz `json:"merged_at"`
+	ClosedAt          pgtype.Timestamptz `json:"closed_at"`
+	MergeableState    pgtype.Text        `json:"mergeable_state"`
 }
 
 // =====================
 // GitLab merge request mirror (github_pull_request, provider='gitlab')
 // =====================
 // installation_id is always NULL for GitLab rows (no installation concept —
-// see migration 155). provider_host carries the registered integration's
-// gitlab_host, widening the identity key alongside provider so two GitLab
-// instances (or GitHub vs GitLab) sharing a repo_owner/repo_name string in
-// one workspace can't overwrite each other. mergeable_state has simpler
-// two-state semantics than GitHub's (no separate "clear on state-changing
-// action" pass): GitLab's merge_status/detailed_merge_status is reported
-// fresh on every webhook delivery, so the incoming value (possibly NULL when
-// GitLab hasn't computed it yet) always overwrites — no "preserve existing
-// column when absent" case like GitHub's metadata-only events.
+// see migration 155). provider_project_id carries the registered
+// integration's stable gitlab_project_id and is the ON CONFLICT target,
+// not repo_owner/repo_name — those come from path_with_namespace, which an
+// admin can rename, and matching on the renamable path would leave a stale
+// duplicate row behind every time a project is renamed (see migration 155's
+// comment on github_pull_request_stable_identity_key). repo_owner/repo_name
+// are still stored and kept fresh on every UPDATE so the UI always shows
+// the current path. mergeable_state has simpler two-state semantics than
+// GitHub's (no separate "clear on state-changing action" pass): GitLab's
+// merge_status/detailed_merge_status is reported fresh on every webhook
+// delivery, so the incoming value (possibly NULL when GitLab hasn't
+// computed it yet) always overwrites — no "preserve existing column when
+// absent" case like GitHub's metadata-only events.
 func (q *Queries) UpsertGitLabMergeRequest(ctx context.Context, arg UpsertGitLabMergeRequestParams) (GithubPullRequest, error) {
 	row := q.db.QueryRow(ctx, upsertGitLabMergeRequest,
 		arg.WorkspaceID,
 		arg.ProviderHost,
+		arg.ProviderProjectID,
 		arg.RepoOwner,
 		arg.RepoName,
 		arg.PrNumber,
@@ -265,6 +275,7 @@ func (q *Queries) UpsertGitLabMergeRequest(ctx context.Context, arg UpsertGitLab
 		&i.ChangedFiles,
 		&i.Provider,
 		&i.ProviderHost,
+		&i.ProviderProjectID,
 	)
 	return i, err
 }

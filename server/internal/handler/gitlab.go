@@ -380,23 +380,27 @@ func parseGitLabTime(s string) pgtype.Timestamptz {
 // handleMergeRequestEvent upserts the MR mirror row, then runs the same
 // auto-link + auto-close-on-merge logic as GitHub's handlePullRequestEvent
 // (github.go's pull_request handling), reusing extractIdentifiers/
-// extractClosingIdentifiers/lookupIssueByIdentifier/LinkIssueToPullRequest/
-// advanceIssueToDone verbatim. GitLab MR webhooks don't include per-commit
-// diff stats (additions/deletions/changed_files), so those fields are left
-// at their zero value — the frontend already treats total==0 as "unknown"
-// and hides the stats row (see pull-request-list.tsx), so this degrades
-// gracefully rather than needing a GitLab-specific UI path. The caller has
-// already validated p.Project.ID against integ.GitlabProjectID.
+// extractClosingIdentifiers/lookupIssueByIdentifierErr/LinkIssueToPullRequest/
+// advanceIssueToDone. GitLab MR webhooks don't include per-commit diff stats
+// (additions/deletions/changed_files), so those fields are left at their
+// zero value — the frontend already treats total==0 as "unknown" and hides
+// the stats row (see pull-request-list.tsx), so this degrades gracefully
+// rather than needing a GitLab-specific UI path. The caller has already
+// validated p.Project.ID against integ.GitlabProjectID.
 //
-// Returns an error when the MR upsert, an issue link, or the close-aggregate
-// lookup fails — the caller turns that into a 5xx so GitLab retries the
-// delivery instead of treating a transient DB failure as delivered and
-// permanently losing the event. Every write here is already idempotent
-// (ON CONFLICT DO UPDATE), so a retry redoing already-successful steps is
-// harmless. A link/aggregate failure does not stop processing the
-// remaining identifiers in the same MR — the first error is remembered and
-// returned after every identifier has been attempted, so one bad row can't
-// mask successful links to other issues referenced by the same MR.
+// Returns an error when the MR upsert, an issue lookup, an issue link, the
+// close-aggregate lookup, or advanceIssueToDone fails — the caller turns
+// that into a 5xx so GitLab retries the delivery instead of treating a
+// transient DB failure as delivered and permanently losing the event (this
+// is why the GitLab path uses lookupIssueByIdentifierErr and checks
+// advanceIssueToDone's return, unlike GitHub's equivalent loop, which
+// discards both since its own webhook path is unconditionally 202). Every
+// write here is already idempotent (ON CONFLICT DO UPDATE), so a retry
+// redoing already-successful steps is harmless. A lookup/link/aggregate
+// failure does not stop processing the remaining identifiers in the same
+// MR — the first error is remembered and returned after every identifier
+// has been attempted, so one bad row can't mask successful links to other
+// issues referenced by the same MR.
 func (h *Handler) handleMergeRequestEvent(ctx context.Context, integ db.GitlabIntegration, p glMergeRequestPayload) error {
 	workspaceID := integ.WorkspaceID
 	state := deriveMRState(p.ObjectAttributes.State, p.ObjectAttributes.Draft)
@@ -420,21 +424,22 @@ func (h *Handler) handleMergeRequestEvent(ctx context.Context, integ db.GitlabIn
 	mergedAt := parseGitLabTime(p.ObjectAttributes.MergedAt)
 
 	pr, err := h.Queries.UpsertGitLabMergeRequest(ctx, db.UpsertGitLabMergeRequestParams{
-		WorkspaceID:    workspaceID,
-		ProviderHost:   integ.GitlabHost,
-		RepoOwner:      repoOwner,
-		RepoName:       repoName,
-		PrNumber:       p.ObjectAttributes.IID,
-		Title:          p.ObjectAttributes.Title,
-		State:          state,
-		HtmlUrl:        p.ObjectAttributes.URL,
-		PrCreatedAt:    createdAt,
-		PrUpdatedAt:    updatedAt,
-		HeadSha:        p.ObjectAttributes.LastCommit.ID,
-		Branch:         strToText(p.ObjectAttributes.SourceBranch),
-		AuthorLogin:    strToText(p.User.Username),
-		MergedAt:       mergedAt,
-		MergeableState: mergeable,
+		WorkspaceID:       workspaceID,
+		ProviderHost:      integ.GitlabHost,
+		ProviderProjectID: pgtype.Int8{Int64: integ.GitlabProjectID, Valid: true},
+		RepoOwner:         repoOwner,
+		RepoName:          repoName,
+		PrNumber:          p.ObjectAttributes.IID,
+		Title:             p.ObjectAttributes.Title,
+		State:             state,
+		HtmlUrl:           p.ObjectAttributes.URL,
+		PrCreatedAt:       createdAt,
+		PrUpdatedAt:       updatedAt,
+		HeadSha:           p.ObjectAttributes.LastCommit.ID,
+		Branch:            strToText(p.ObjectAttributes.SourceBranch),
+		AuthorLogin:       strToText(p.User.Username),
+		MergedAt:          mergedAt,
+		MergeableState:    mergeable,
 	})
 	if err != nil {
 		slog.Warn("gitlab: upsert mr failed", "err", err)
@@ -468,7 +473,14 @@ func (h *Handler) handleMergeRequestEvent(ctx context.Context, integ db.GitlabIn
 	reevalIssues := make([]db.Issue, 0, len(idents))
 	var firstErr error
 	for _, id := range idents {
-		issue, ok := h.lookupIssueByIdentifier(ctx, workspaceID, prefix, id)
+		issue, ok, err := h.lookupIssueByIdentifierErr(ctx, workspaceID, prefix, id)
+		if err != nil {
+			slog.Warn("gitlab: issue lookup failed", "err", err)
+			if firstErr == nil {
+				firstErr = fmt.Errorf("lookup issue by identifier: %w", err)
+			}
+			continue
+		}
 		if !ok {
 			continue
 		}
@@ -506,7 +518,11 @@ func (h *Handler) handleMergeRequestEvent(ctx context.Context, integ db.GitlabIn
 				continue
 			}
 			if counts.OpenCount == 0 && counts.MergedWithCloseIntentCount > 0 {
-				h.advanceIssueToDone(ctx, issue, workspaceIDStr, "gitlab_mr_merged")
+				if err := h.advanceIssueToDone(ctx, issue, workspaceIDStr, "gitlab_mr_merged"); err != nil {
+					if firstErr == nil {
+						firstErr = fmt.Errorf("advance issue to done: %w", err)
+					}
+				}
 			}
 		}
 	}
