@@ -165,7 +165,7 @@ describe("ProjectWebhooksSection", () => {
     expect(optionsProjectId.current).toBe(PROJECT_ID);
   });
 
-  it("creates a project-scoped subscription with project_id and every event by default", async () => {
+  it("creates a project-scoped subscription with project_id and only issue.status_changed by default", async () => {
     mockCreate.mockResolvedValue(makeSub({ secret: "whsec_revealed" }));
     render(<ProjectWebhooksSection projectId={PROJECT_ID} />, {
       wrapper: I18nWrapper,
@@ -183,13 +183,13 @@ describe("ProjectWebhooksSection", () => {
       expect(mockCreate).toHaveBeenCalledWith({
         url: "https://p.example.com/hook",
         project_id: PROJECT_ID,
-        events: ["issue.status_changed", "issue.assigned", "comment.created"],
+        events: ["issue.status_changed"],
       }),
     );
     expect(await screen.findByText("whsec_revealed")).toBeTruthy();
   });
 
-  it("narrows events via the compact events dropdown before creating", async () => {
+  it("widens events via the compact events dropdown before creating", async () => {
     mockCreate.mockResolvedValue(makeSub({ secret: "whsec_revealed" }));
     render(<ProjectWebhooksSection projectId={PROJECT_ID} />, {
       wrapper: I18nWrapper,
@@ -202,8 +202,9 @@ describe("ProjectWebhooksSection", () => {
     );
 
     // Content renders unconditionally under the dropdown-menu mock (see the
-    // module mock's comment) — no "open" step needed. Uncheck comment.created.
-    await userEvent.click(screen.getByText("comment.created"));
+    // module mock's comment) — no "open" step needed. Check issue.assigned to
+    // widen the default single-event selection.
+    await userEvent.click(screen.getByText("issue.assigned"));
     await userEvent.click(screen.getByRole("button", { name: /^Add$/i }));
 
     await waitFor(() =>

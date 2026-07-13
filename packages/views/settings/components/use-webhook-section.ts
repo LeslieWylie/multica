@@ -16,7 +16,6 @@ import type {
   WebhookSubscription,
   WebhookSubscriptionEvent,
 } from "@multica/core/types";
-import { WEBHOOK_SUBSCRIPTION_EVENTS } from "@multica/core/types";
 import { useT } from "../../i18n";
 
 // useWebhookSection owns all state + actions shared by the workspace-level
@@ -29,11 +28,14 @@ export interface UseWebhookSectionResult {
   subscriptions: WebhookSubscription[];
   newUrl: string;
   setNewUrl: (v: string) => void;
-  // Events checked in the create form. Defaults to every known event so a
-  // subscription created without touching the checklist still gets the same
-  // "subscribe to everything" behavior the old URL-only form had (the server
-  // defaults to issue.status_changed alone when events is omitted entirely,
-  // but the checklist always sends an explicit list once rendered).
+  // Events checked in the create form. Defaults to just issue.status_changed
+  // — matching the server's own default when `events` is omitted entirely
+  // (see webhook_subscription.go's `if len(req.Events) == 0`) — so a
+  // subscription created without touching the checklist behaves exactly like
+  // the old URL-only form did. Upgrading must not silently widen what a
+  // freshly created subscription receives (e.g. opting every new webhook
+  // into full comment bodies by default); widening requires the user to
+  // explicitly check the additional boxes.
   newEvents: WebhookSubscriptionEvent[];
   toggleNewEvent: (event: WebhookSubscriptionEvent, checked: boolean) => void;
   createdSecret: string | null;
@@ -85,11 +87,11 @@ export function useWebhookSection(
   const deleteMutation = useDeleteWebhookSubscription(projectId);
 
   const [newUrl, setNewUrl] = useState("");
-  // Defaults to "subscribe to everything" — matches the old URL-only form's
-  // implicit behavior before the checklist existed, so upgrading doesn't
-  // silently narrow what a freshly created subscription receives.
+  // Defaults to just issue.status_changed, matching the server's own default
+  // for an omitted `events` field — see the interface doc comment above for
+  // why this must not default to "select everything."
   const [newEvents, setNewEvents] = useState<WebhookSubscriptionEvent[]>([
-    ...WEBHOOK_SUBSCRIPTION_EVENTS,
+    "issue.status_changed",
   ]);
   // The signing secret is returned once on create; surfaced in a dialog so the
   // operator can copy it before it becomes unreachable.
@@ -119,7 +121,7 @@ export function useWebhookSection(
         events: newEvents,
       });
       setNewUrl("");
-      setNewEvents([...WEBHOOK_SUBSCRIPTION_EVENTS]);
+      setNewEvents(["issue.status_changed"]);
       if (created.secret) setCreatedSecret(created.secret);
       toast.success(t(($) => $.webhooks.toast_created));
     } catch (e) {
