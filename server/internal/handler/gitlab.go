@@ -267,7 +267,11 @@ func (h *Handler) HandleGitLabWebhook(w http.ResponseWriter, r *http.Request) {
 		var p glMergeRequestPayload
 		if err := json.Unmarshal(body, &p); err != nil {
 			slog.Warn("gitlab: bad merge_request payload", "err", err)
-			w.WriteHeader(http.StatusAccepted)
+			// A malformed payload will never parse on retry either, so
+			// there is no reason to 202 it as if it were accepted — that
+			// would tell GitLab delivery succeeded while nothing was
+			// persisted, permanently losing the event.
+			writeError(w, http.StatusBadRequest, "malformed merge_request payload")
 			return
 		}
 		// The secret alone proves the request knows this integration's
@@ -285,7 +289,17 @@ func (h *Handler) HandleGitLabWebhook(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "webhook is configured for a different GitLab project")
 			return
 		}
-		h.handleMergeRequestEvent(r.Context(), integ, p)
+		if err := h.handleMergeRequestEvent(r.Context(), integ, p); err != nil {
+			slog.Warn("gitlab: merge request event failed", "err", err, "integration_id", integrationID)
+			// A non-2xx here (rather than swallowing the error into a 202)
+			// makes GitLab retry the delivery. Every write inside
+			// handleMergeRequestEvent is idempotent, so a retry that redoes
+			// already-successful steps is harmless — the alternative is
+			// telling GitLab the event was delivered when it was actually
+			// dropped by a transient DB failure.
+			writeError(w, http.StatusInternalServerError, "failed to process merge request event")
+			return
+		}
 	default:
 		// Acknowledge every event so GitLab doesn't mark the endpoint
 		// failing, but ignore types we don't model (push, note, pipeline,
@@ -313,9 +327,21 @@ type glMergeRequestPayload struct {
 		Draft               bool   `json:"draft"`
 		MergeStatus         string `json:"merge_status"`
 		DetailedMergeStatus string `json:"detailed_merge_status"`
-		MergeCommitSha      string `json:"merge_commit_sha"`
-		CreatedAt           string `json:"created_at"`
-		UpdatedAt           string `json:"updated_at"`
+		// MergeCommitSha is only present once the MR has actually been
+		// merged (null/absent on an open MR per GitLab's documented
+		// payload) — it identifies the merge commit itself, not the
+		// source branch's current HEAD, so it is NOT used for head_sha
+		// (see LastCommit below).
+		MergeCommitSha string `json:"merge_commit_sha"`
+		// LastCommit.ID is the source branch's current HEAD commit —
+		// present on every MR state, open or merged — and is what
+		// head_sha is meant to track for review-task dedup, mirroring
+		// GitHub's pull_request.head.sha.
+		LastCommit struct {
+			ID string `json:"id"`
+		} `json:"last_commit"`
+		CreatedAt string `json:"created_at"`
+		UpdatedAt string `json:"updated_at"`
 		// MergedAt is absent/empty until the MR is actually merged.
 		MergedAt string `json:"merged_at"`
 	} `json:"object_attributes"`
@@ -361,7 +387,17 @@ func parseGitLabTime(s string) pgtype.Timestamptz {
 // and hides the stats row (see pull-request-list.tsx), so this degrades
 // gracefully rather than needing a GitLab-specific UI path. The caller has
 // already validated p.Project.ID against integ.GitlabProjectID.
-func (h *Handler) handleMergeRequestEvent(ctx context.Context, integ db.GitlabIntegration, p glMergeRequestPayload) {
+//
+// Returns an error when the MR upsert, an issue link, or the close-aggregate
+// lookup fails — the caller turns that into a 5xx so GitLab retries the
+// delivery instead of treating a transient DB failure as delivered and
+// permanently losing the event. Every write here is already idempotent
+// (ON CONFLICT DO UPDATE), so a retry redoing already-successful steps is
+// harmless. A link/aggregate failure does not stop processing the
+// remaining identifiers in the same MR — the first error is remembered and
+// returned after every identifier has been attempted, so one bad row can't
+// mask successful links to other issues referenced by the same MR.
+func (h *Handler) handleMergeRequestEvent(ctx context.Context, integ db.GitlabIntegration, p glMergeRequestPayload) error {
 	workspaceID := integ.WorkspaceID
 	state := deriveMRState(p.ObjectAttributes.State, p.ObjectAttributes.Draft)
 	mergeable := deriveMRMergeableState(p.ObjectAttributes.DetailedMergeStatus, p.ObjectAttributes.MergeStatus)
@@ -394,7 +430,7 @@ func (h *Handler) handleMergeRequestEvent(ctx context.Context, integ db.GitlabIn
 		HtmlUrl:        p.ObjectAttributes.URL,
 		PrCreatedAt:    createdAt,
 		PrUpdatedAt:    updatedAt,
-		HeadSha:        p.ObjectAttributes.MergeCommitSha,
+		HeadSha:        p.ObjectAttributes.LastCommit.ID,
 		Branch:         strToText(p.ObjectAttributes.SourceBranch),
 		AuthorLogin:    strToText(p.User.Username),
 		MergedAt:       mergedAt,
@@ -402,7 +438,7 @@ func (h *Handler) handleMergeRequestEvent(ctx context.Context, integ db.GitlabIn
 	})
 	if err != nil {
 		slog.Warn("gitlab: upsert mr failed", "err", err)
-		return
+		return fmt.Errorf("upsert merge request: %w", err)
 	}
 
 	workspaceIDStr := uuidToString(workspaceID)
@@ -430,6 +466,7 @@ func (h *Handler) handleMergeRequestEvent(ctx context.Context, integ db.GitlabIn
 	preserveCloseIntent := deriveMRPreserveCloseIntent(p.ObjectAttributes.Action, state)
 	prefix := h.getIssuePrefix(ctx, workspaceID)
 	reevalIssues := make([]db.Issue, 0, len(idents))
+	var firstErr error
 	for _, id := range idents {
 		issue, ok := h.lookupIssueByIdentifier(ctx, workspaceID, prefix, id)
 		if !ok {
@@ -446,6 +483,9 @@ func (h *Handler) handleMergeRequestEvent(ctx context.Context, integ db.GitlabIn
 			LinkedByID:          pgtype.UUID{},
 		}); err != nil {
 			slog.Warn("gitlab: link failed", "err", err)
+			if firstErr == nil {
+				firstErr = fmt.Errorf("link issue to merge request: %w", err)
+			}
 			continue
 		}
 		linkedIssueIDs = append(linkedIssueIDs, uuidToString(issue.ID))
@@ -460,6 +500,9 @@ func (h *Handler) handleMergeRequestEvent(ctx context.Context, integ db.GitlabIn
 			counts, err := h.Queries.GetIssuePullRequestCloseAggregate(ctx, issue.ID)
 			if err != nil {
 				slog.Warn("gitlab: count linked mr states failed", "err", err, "issue_id", uuidToString(issue.ID))
+				if firstErr == nil {
+					firstErr = fmt.Errorf("compute issue close aggregate: %w", err)
+				}
 				continue
 			}
 			if counts.OpenCount == 0 && counts.MergedWithCloseIntentCount > 0 {
@@ -472,6 +515,7 @@ func (h *Handler) handleMergeRequestEvent(ctx context.Context, integ db.GitlabIn
 		"pull_request":     resp,
 		"linked_issue_ids": linkedIssueIDs,
 	})
+	return firstErr
 }
 
 // deriveMRState maps GitLab's object_attributes.state ("opened", "closed",
