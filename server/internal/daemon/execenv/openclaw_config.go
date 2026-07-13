@@ -60,7 +60,6 @@ func openclawCLITimeoutFromEnv() time.Duration {
 	return defaultOpenclawCLITimeoutSeconds * time.Second
 }
 
-
 // OpenclawConfigPrep is the input to prepareOpenclawConfig. Only OpenclawBin
 // is meaningful in production — Timeout is here for tests that need a tight
 // cap to assert error paths.

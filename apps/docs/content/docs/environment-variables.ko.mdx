@@ -184,6 +184,7 @@ S3 앞에 CloudFront를 두는 경우 세 가지 변수가 적용됩니다: `CLO
 | `MULTICA_<PROVIDER>_PATH` | CLI 이름과 일치 | 각 AI 코딩 도구 실행 파일의 경로 (예: `MULTICA_CLAUDE_PATH`) |
 | `MULTICA_<PROVIDER>_MODEL` | 비어 있음 | 각 AI 코딩 도구의 기본 모델 |
 | `MULTICA_<PROVIDER>_ARGS` | 비어 있음 | 백엔드별 데몬 전역 기본 CLI 인자. 각 작업에 대해 각 에이전트 자체의 `custom_args`보다 먼저 적용됩니다. `MULTICA_CLAUDE_ARGS`, `MULTICA_CODEX_ARGS`, `MULTICA_CODEBUDDY_ARGS`를 지원 |
+| `MULTICA_OPENCLAW_CLI_TIMEOUT_SECONDS` | `5` | 데몬이 OpenClaw 작업 환경을 준비할 때 실행하는 각 `openclaw config ...` 호출의 제한 시간. 느린 머신이나 여러 작업이 동시에 시작될 때 작업 준비가 `signal: killed`로 실패하면 이 값을 늘리세요 — 콜드 스타트 상태의 `openclaw` CLI 호출은 단독으로 2.4-4.2초, 동시 여러 작업 시작 시 7초 이상이 측정되었습니다. 설정하지 않거나 비어 있거나 숫자가 아니거나 양수가 아닌 값은 기본값으로 대체됩니다 |
 
 각 파라미터가 데몬 동작에 어떻게 영향을 미치는지에 대한 전체 설명은 [데몬과 런타임](/daemon-runtimes)을 참고하세요.
 
