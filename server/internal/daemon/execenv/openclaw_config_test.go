@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -34,6 +36,12 @@ func TestOpenclawCLITimeoutFromEnv(t *testing.T) {
 		{"float_falls_back", "5.5", defaultOpenclawCLITimeoutSeconds * time.Second},
 		{"whitespace_only_falls_back", "   ", defaultOpenclawCLITimeoutSeconds * time.Second},
 		{"surrounding_whitespace_is_trimmed", "  20  ", 20 * time.Second},
+		{"max_seconds_that_fits_is_honored", strconv.FormatInt(maxOpenclawCLITimeoutSeconds, 10), time.Duration(maxOpenclawCLITimeoutSeconds) * time.Second},
+		// A value that ParseInt accepts as a valid int64 but that would
+		// overflow when multiplied by time.Second must fall back to the
+		// default, not silently wrap into a garbage (possibly negative)
+		// Duration. math.MaxInt64 is comfortably past maxOpenclawCLITimeoutSeconds.
+		{"overflow_falls_back", strconv.FormatInt(math.MaxInt64, 10), defaultOpenclawCLITimeoutSeconds * time.Second},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
