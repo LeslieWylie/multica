@@ -594,9 +594,13 @@ func (d *Dispatcher) dispatchAssigned(ev IssueAssigned) {
 // dispatcher does not depend on the handler package.
 type CommentCreated struct {
 	WorkspaceID string
-	ActorType   string
-	ActorID     string
-	Comment     any
+	// ProjectID is the project of the comment's issue, "" when the issue has
+	// no project — same convention as IssueStatusChanged/IssueAssigned, used
+	// by subscriptionMatches to gate project-level subscriptions.
+	ProjectID string
+	ActorType string
+	ActorID   string
+	Comment   any
 	// IssueID / IssueTitle / IssueStatus give receivers the issue context
 	// without requiring a follow-up API call. There is no issue identifier
 	// (e.g. "MUL-123") available on the comment:created payload today, so
@@ -638,11 +642,10 @@ func (d *Dispatcher) DispatchCommentCreated(ev CommentCreated) {
 }
 
 // dispatchComment (off the request path, on a bounded dispatch worker) selects
-// matching subscriptions and enqueues their deliveries. comment.created has no
-// project scoping (comments don't carry a project_id independent of their
-// issue), so every enabled subscription that opted into the event fires
-// regardless of project — mirroring how project-level filtering only applies
-// to issue-shaped events in this dispatcher today.
+// matching subscriptions and enqueues their deliveries. Project-level
+// subscriptions only receive comments on issues in their own project — same
+// subscriptionMatches gate as issue.status_changed/issue.assigned — via
+// ProjectID resolved from the comment's issue by the listener.
 func (d *Dispatcher) dispatchComment(ev CommentCreated) {
 	wsUUID, err := util.ParseUUID(ev.WorkspaceID)
 	if err != nil {
@@ -660,7 +663,7 @@ func (d *Dispatcher) dispatchComment(ev CommentCreated) {
 
 	matched := make([]db.WebhookSubscription, 0, len(subs))
 	for _, s := range subs {
-		if subscribedToEvent(s, EventCommentCreated) {
+		if subscriptionMatches(s, ev.ProjectID) && subscribedToEvent(s, EventCommentCreated) {
 			matched = append(matched, s)
 		}
 	}

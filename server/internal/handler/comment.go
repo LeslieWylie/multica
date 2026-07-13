@@ -1257,6 +1257,7 @@ func (h *Handler) CreateComment(w http.ResponseWriter, r *http.Request) {
 		"issue_assignee_type": textToPtr(issue.AssigneeType),
 		"issue_assignee_id":   uuidToPtr(issue.AssigneeID),
 		"issue_status":        issue.Status,
+		"issue_project_id":    uuidToPtr(issue.ProjectID),
 	})
 
 	// A reply in a resolved thread re-opens it. Done after CreateComment commits

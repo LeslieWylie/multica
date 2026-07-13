@@ -450,10 +450,14 @@ func TestDispatchAssignedSkipsUnsubscribedEvent(t *testing.T) {
 }
 
 // TestDispatchCommentDeliversToMatchingSubscriptions mirrors
-// TestDispatchDeliversToMatchingSubscriptions for comment.created. Unlike the
-// issue-shaped events, comment.created is not project-scoped: a project-level
-// subscription still fires because dispatchComment only filters on
-// subscribedToEvent, not subscriptionMatches.
+// TestDispatchDeliversToMatchingSubscriptions for comment.created:
+// comment.created is now project-scoped the same way issue-shaped events are
+// — a workspace-level subscription receives every comment, a project-level
+// subscription only receives comments on issues in its own project. A
+// project-level subscription for a DIFFERENT project (projB) is included
+// specifically to prove the scope bypass regression (a project-B webhook
+// receiving project-A comment bodies) is fixed, not just that matching
+// subscriptions still work.
 func TestDispatchCommentDeliversToMatchingSubscriptions(t *testing.T) {
 	c := &collector{wg: &sync.WaitGroup{}}
 	srv := httptest.NewServer(http.HandlerFunc(c.handler))
@@ -462,13 +466,14 @@ func TestDispatchCommentDeliversToMatchingSubscriptions(t *testing.T) {
 	store := &fakeStore{subs: []db.WebhookSubscription{
 		sub(t, subID1, "", []string{EventCommentCreated}, srv.URL),
 		sub(t, projA, projA, []string{EventCommentCreated}, srv.URL),
-		sub(t, projB, projB, []string{EventIssueStatusChanged}, srv.URL), // not subscribed to comment.created
+		sub(t, projB, projB, []string{EventCommentCreated}, srv.URL), // different project — must NOT receive projA's comment
 	}}
 	d := newTestDispatcher(t, store, &http.Client{Timeout: deliveryTimeout})
 
-	c.wg.Add(2) // subID1 (workspace-level) + projA; projB is unsubscribed
+	c.wg.Add(2) // subID1 (workspace-level) + projA; projB is a different project
 	d.DispatchCommentCreated(CommentCreated{
 		WorkspaceID: wsID,
+		ProjectID:   projA,
 		ActorType:   "member",
 		ActorID:     "actor-1",
 		Comment:     map[string]any{"id": "comment-1", "content": "hello"},
@@ -482,7 +487,7 @@ func TestDispatchCommentDeliversToMatchingSubscriptions(t *testing.T) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if len(c.bodies) != 2 {
-		t.Fatalf("expected 2 deliveries, got %d", len(c.bodies))
+		t.Fatalf("expected 2 deliveries (workspace-level + matching project), got %d — projB must not have received project A's comment", len(c.bodies))
 	}
 
 	var payload struct {
@@ -515,6 +520,41 @@ func TestDispatchCommentDeliversToMatchingSubscriptions(t *testing.T) {
 	}
 	if !webhooksign.Verify("whsec_test", c.sigs[0], c.bodies[0]) {
 		t.Errorf("signature did not verify: %q", c.sigs[0])
+	}
+}
+
+// TestDispatchCommentOnProjectlessIssueOnlyReachesWorkspaceLevelSubs covers
+// the other half of the scoping fix: a comment on an issue with no project
+// (ProjectID == "") must still reach workspace-level subscriptions but must
+// NOT reach a project-scoped subscription — mirroring subscriptionMatches'
+// existing semantics for issue-shaped events.
+func TestDispatchCommentOnProjectlessIssueOnlyReachesWorkspaceLevelSubs(t *testing.T) {
+	c := &collector{wg: &sync.WaitGroup{}}
+	srv := httptest.NewServer(http.HandlerFunc(c.handler))
+	defer srv.Close()
+
+	store := &fakeStore{subs: []db.WebhookSubscription{
+		sub(t, subID1, "", []string{EventCommentCreated}, srv.URL),
+		sub(t, projA, projA, []string{EventCommentCreated}, srv.URL),
+	}}
+	d := newTestDispatcher(t, store, &http.Client{Timeout: deliveryTimeout})
+
+	c.wg.Add(1) // only the workspace-level subscription
+	d.DispatchCommentCreated(CommentCreated{
+		WorkspaceID: wsID,
+		ProjectID:   "",
+		ActorType:   "member",
+		ActorID:     "actor-1",
+		Comment:     map[string]any{"id": "comment-1", "content": "hello"},
+		IssueID:     "issue-2",
+	})
+
+	waitTimeout(t, c.wg, 5*time.Second)
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.bodies) != 1 {
+		t.Fatalf("expected 1 delivery (workspace-level only), got %d", len(c.bodies))
 	}
 }
 

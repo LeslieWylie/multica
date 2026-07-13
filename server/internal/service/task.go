@@ -2382,8 +2382,9 @@ func (s *TaskService) createAgentComment(ctx context.Context, issueID, agentID p
 				"source_task_id": util.UUIDToPtr(comment.SourceTaskID),
 				"created_at":     comment.CreatedAt.Time.Format("2006-01-02T15:04:05Z"),
 			},
-			"issue_title":  issue.Title,
-			"issue_status": issue.Status,
+			"issue_title":      issue.Title,
+			"issue_status":     issue.Status,
+			"issue_project_id": util.UUIDToPtr(issue.ProjectID),
 		},
 	})
 	s.AutoUnresolveThreadOnReply(ctx, rootComment, util.UUIDToString(issue.WorkspaceID), "agent", util.UUIDToString(agentID))
