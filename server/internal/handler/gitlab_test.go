@@ -58,6 +58,13 @@ func setupGitLabTestIssue(t *testing.T, ctx context.Context) (IssueResponse, db.
 
 // mrPayloadOpts lets each test override only the fields it cares about;
 // fireMergeRequestWebhook fills in reasonable defaults for the rest.
+// mergeCommitSha and lastCommitID are deliberately separate fields (not one
+// "the current sha" field) — GitLab only populates merge_commit_sha once
+// the MR is actually merged (null on an open MR); last_commit.id is present
+// on every state and is what head_sha is meant to track. Defaulting
+// mergeCommitSha to "" here means a test that doesn't explicitly set it
+// exercises the real "open MR" shape rather than accidentally masking the
+// bug this was written to catch.
 type mrPayloadOpts struct {
 	projectID           int64
 	projectPath         string
@@ -73,6 +80,8 @@ type mrPayloadOpts struct {
 	createdAt           string
 	updatedAt           string
 	mergedAt            string
+	lastCommitID        string
+	mergeCommitSha      string
 }
 
 // fireMergeRequestWebhook posts a "Merge Request Hook" payload through
@@ -93,7 +102,8 @@ func fireMergeRequestWebhook(t *testing.T, integrationID, secret string, opts mr
 			"draft":                 opts.draft,
 			"merge_status":          opts.mergeStatus,
 			"detailed_merge_status": opts.detailedMergeStatus,
-			"merge_commit_sha":      "deadbeef",
+			"merge_commit_sha":      opts.mergeCommitSha,
+			"last_commit":           map[string]any{"id": opts.lastCommitID},
 			"created_at":            opts.createdAt,
 			"updated_at":            opts.updatedAt,
 			"merged_at":             opts.mergedAt,
@@ -248,6 +258,10 @@ func TestGitLabWebhook_AutoLinksAndUpsertsMR(t *testing.T) {
 		detailedMergeStatus: "mergeable",
 		createdAt:           "2026-01-16 05:56:22 UTC",
 		updatedAt:           "2026-01-16 05:56:22 UTC",
+		// mergeCommitSha intentionally left empty — GitLab never populates
+		// it on an open MR. lastCommitID is the source branch's current
+		// HEAD, which is what head_sha below must come from.
+		lastCommitID: "abc1112223334445556667778889990001112223",
 	})
 
 	rows, err := testHandler.Queries.ListPullRequestsByIssue(ctx, parseUUID(created.ID))
@@ -273,8 +287,61 @@ func TestGitLabWebhook_AutoLinksAndUpsertsMR(t *testing.T) {
 	if row.InstallationID.Valid {
 		t.Errorf("installation_id should be NULL for a GitLab row, got %+v", row.InstallationID)
 	}
+	// head_sha must come from last_commit.id (the source branch's current
+	// HEAD), not merge_commit_sha (null on an open MR per GitLab's
+	// documented payload — using it would silently store an empty string
+	// here and break review-task dedup for every open MR).
+	if row.HeadSha != "abc1112223334445556667778889990001112223" {
+		t.Errorf("head_sha = %q, want the open MR's last_commit.id", row.HeadSha)
+	}
 	if row.PrCreatedAt.Time.Year() != 2026 {
 		t.Errorf("pr_created_at should come from the payload's created_at, got %v", row.PrCreatedAt.Time)
+	}
+}
+
+// TestGitLabWebhook_PushUpdatesHeadSha covers the other half of the
+// head_sha fix: when a new commit lands on an open MR's source branch (a
+// "push"/"update" delivery, not open or merge), last_commit.id changes and
+// head_sha must track it — this is what lets review-task dedup key off the
+// MR's CURRENT head rather than getting stuck on the id it had when first
+// opened.
+func TestGitLabWebhook_PushUpdatesHeadSha(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("handler test fixture not initialized (no DB?)")
+	}
+	ctx := context.Background()
+	created, integ, secret := setupGitLabTestIssue(t, ctx)
+
+	fireMergeRequestWebhook(t, uuidToString(integ.ID), secret, mrPayloadOpts{
+		projectID:    integ.GitlabProjectID,
+		projectPath:  integ.GitlabProjectPath,
+		iid:          1,
+		title:        "Fix " + created.Identifier,
+		state:        "opened",
+		action:       "open",
+		sourceBranch: "fix/" + created.Identifier,
+		lastCommitID: "firstcommit1112223334445556667778889990",
+	})
+	fireMergeRequestWebhook(t, uuidToString(integ.ID), secret, mrPayloadOpts{
+		projectID:    integ.GitlabProjectID,
+		projectPath:  integ.GitlabProjectPath,
+		iid:          1,
+		title:        "Fix " + created.Identifier,
+		state:        "opened",
+		action:       "update",
+		sourceBranch: "fix/" + created.Identifier,
+		lastCommitID: "secondcommit22233344455566677788899900011",
+	})
+
+	rows, err := testHandler.Queries.ListPullRequestsByIssue(ctx, parseUUID(created.ID))
+	if err != nil {
+		t.Fatalf("ListPullRequestsByIssue: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 linked MR, got %d", len(rows))
+	}
+	if got := rows[0].HeadSha; got != "secondcommit22233344455566677788899900011" {
+		t.Errorf("head_sha = %q, want the pushed update's new last_commit.id", got)
 	}
 }
 
@@ -300,7 +367,24 @@ func TestGitLabWebhook_MergedAdvancesIssueToDone(t *testing.T) {
 		createdAt:    "2026-01-16 05:56:22 UTC",
 		updatedAt:    "2026-01-16 06:00:00 UTC",
 		mergedAt:     "2026-01-16 06:00:00 UTC",
+		// A merged MR carries both: last_commit is still the reviewed
+		// source-branch HEAD (what head_sha must store), merge_commit_sha
+		// is the newly created merge commit (not the same value, and not
+		// what head_sha tracks — see TestGitLabWebhook_AutoLinksAndUpsertsMR).
+		lastCommitID:   "sourcecommit111222333444555666777888999",
+		mergeCommitSha: "mergecommit999888777666555444333222111",
 	})
+
+	rows, err := testHandler.Queries.ListPullRequestsByIssue(ctx, parseUUID(created.ID))
+	if err != nil {
+		t.Fatalf("ListPullRequestsByIssue: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 linked MR, got %d", len(rows))
+	}
+	if got := rows[0].HeadSha; got != "sourcecommit111222333444555666777888999" {
+		t.Errorf("head_sha = %q, want the merged MR's last_commit.id (the reviewed source HEAD), not merge_commit_sha", got)
+	}
 
 	final, err := testHandler.Queries.GetIssue(ctx, parseUUID(created.ID))
 	if err != nil {
@@ -309,13 +393,8 @@ func TestGitLabWebhook_MergedAdvancesIssueToDone(t *testing.T) {
 	if final.Status != "done" {
 		t.Errorf("expected issue done after merged MR with closing intent, got %q", final.Status)
 	}
-
-	rows, err := testHandler.Queries.ListPullRequestsByIssue(ctx, parseUUID(created.ID))
-	if err != nil {
-		t.Fatalf("ListPullRequestsByIssue: %v", err)
-	}
-	if len(rows) != 1 || !rows[0].MergedAt.Valid {
-		t.Fatalf("expected 1 row with merged_at set from the payload, got %+v", rows)
+	if !rows[0].MergedAt.Valid {
+		t.Fatalf("expected merged_at set from the payload, got %+v", rows[0])
 	}
 }
 
@@ -439,6 +518,79 @@ func TestGitLabWebhook_ProjectIDMismatchRejected(t *testing.T) {
 	}
 	if len(rows) != 0 {
 		t.Fatalf("expected no rows written for a rejected project-id-mismatch payload, got %d", len(rows))
+	}
+}
+
+// TestGitLabWebhook_MalformedPayloadRejected covers the other half of the
+// 202-swallows-everything fix: a body that isn't valid JSON can never
+// succeed on retry either, so it must 400 rather than 202 — a 202 here
+// would tell GitLab the (unparseable, never-persisted) event was delivered.
+func TestGitLabWebhook_MalformedPayloadRejected(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("handler test fixture not initialized (no DB?)")
+	}
+	ctx := context.Background()
+	_, integ, secret := setupGitLabTestIssue(t, ctx)
+
+	rec := httptest.NewRecorder()
+	id := uuidToString(integ.ID)
+	hookReq := httptest.NewRequest("POST", "/api/webhooks/gitlab/"+id, bytes.NewReader([]byte("not valid json{{{")))
+	hookReq = withURLParam(hookReq, "integrationId", id)
+	hookReq.Header.Set("X-Gitlab-Event", "Merge Request Hook")
+	hookReq.Header.Set("X-Gitlab-Token", secret)
+	testHandler.HandleGitLabWebhook(rec, hookReq)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for a malformed payload, got %d (%s)", rec.Code, rec.Body.String())
+	}
+}
+
+// TestHandleMergeRequestEvent_UpsertFailurePropagatesError covers the core
+// of the 202-swallows-everything fix: when the MR upsert itself fails,
+// handleMergeRequestEvent must return a non-nil error (so the HTTP layer
+// can turn it into a 5xx and let GitLab retry) instead of logging and
+// returning as if nothing went wrong. Exercised directly against
+// handleMergeRequestEvent (bypassing the HTTP/integration-lookup layer)
+// because a real integration row can never point at a workspace_id that
+// doesn't exist — gitlab_integration.workspace_id has a FOREIGN KEY to
+// workspace(id), so that combination is unreachable through the public
+// create-integration API. Pointing a payload at a workspace_id with no
+// matching row is the simplest way to force a real, deterministic
+// constraint violation on the upsert without any fault-injection
+// machinery.
+func TestHandleMergeRequestEvent_UpsertFailurePropagatesError(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("handler test fixture not initialized (no DB?)")
+	}
+	ctx := context.Background()
+
+	fakeWorkspaceID := parseUUID("00000000-0000-0000-0000-000000000abc")
+	integ := db.GitlabIntegration{
+		WorkspaceID:       fakeWorkspaceID,
+		GitlabHost:        "gitlab.example",
+		GitlabProjectID:   4242,
+		GitlabProjectPath: "acme/ghost-workspace",
+	}
+	payload := glMergeRequestPayload{}
+	payload.ObjectAttributes.IID = 1
+	payload.ObjectAttributes.Title = "Fix SOMETHING-1"
+	payload.ObjectAttributes.State = "opened"
+	payload.ObjectAttributes.Action = "open"
+	payload.Project.ID = integ.GitlabProjectID
+	payload.Project.PathWithNamespace = integ.GitlabProjectPath
+
+	err := testHandler.handleMergeRequestEvent(ctx, integ, payload)
+	if err == nil {
+		t.Fatal("expected handleMergeRequestEvent to return an error when the upsert violates the workspace_id foreign key, got nil")
+	}
+
+	var count int
+	if scanErr := testPool.QueryRow(ctx, `
+		SELECT count(*) FROM github_pull_request WHERE provider = 'gitlab' AND repo_owner = 'acme' AND repo_name = 'ghost-workspace'
+	`).Scan(&count); scanErr != nil {
+		t.Fatalf("count rows: %v", scanErr)
+	}
+	if count != 0 {
+		t.Errorf("expected no row persisted after a failed upsert, got %d", count)
 	}
 }
 
