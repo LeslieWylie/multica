@@ -23,19 +23,21 @@ default `table` shows `NUMBER STATE TITLE URL`.
 
 ## PR response shape
 
-`GitHubPullRequestResponse` struct: `server/internal/handler/github.go:51`. JSON
+`GitHubPullRequestResponse` struct: `server/internal/handler/github.go:57`. JSON
 fields the agent can read off each element of `pull_requests`:
 
-- `number` (`json:"number"`, line 56)
-- `html_url` (`json:"html_url"`, line 59)
-- `title` (`json:"title"`, line 57)
-- `state` (`json:"state"`, line 58) — the folded lifecycle enum (see below)
-- `merged_at` (`json:"merged_at"`, line 63), `closed_at` (line 64)
-- `mergeable_state` (`json:"mergeable_state"`, line 70) — mirrors GitHub; UI only
+- `provider` (`json:"provider"`, line 63) — `"github"` or `"gitlab"`; every
+  other field below means the same thing for both providers
+- `number` (`json:"number"`, line 66)
+- `html_url` (`json:"html_url"`, line 69)
+- `title` (`json:"title"`, line 67)
+- `state` (`json:"state"`, line 68) — the folded lifecycle enum (see below)
+- `merged_at` (`json:"merged_at"`, line 73), `closed_at` (line 74)
+- `mergeable_state` (`json:"mergeable_state"`, line 80) — mirrors GitHub; UI only
   surfaces `clean`/`dirty`, other values round-trip as unknown
-- `checks_conclusion` (`json:"checks_conclusion"`, line 74) — aggregated
+- `checks_conclusion` (`json:"checks_conclusion"`, line 84) — aggregated
   `"passed"`/`"failed"`/`"pending"` or `null` (no observed suite)
-- `checks_passed` / `checks_failed` / `checks_pending` (lines 78-80) — per-suite
+- `checks_passed` / `checks_failed` / `checks_pending` (lines 88-90) — per-suite
   counts; `aggregateChecksConclusion` (line 183) folds them into
   `checks_conclusion`
 
@@ -110,6 +112,20 @@ Net: a bare title prefix (`MUL-2759: ...`) or a branch ref links only (shown in
 the PR list); `Closes MUL-2759` links **and** records close intent; a bare body
 mention with no title/branch ref and no closing keyword links as `reference_only`
 and is hidden from the PR list.
+
+## GitLab MR webhook shares this exact implementation
+
+`handleMergeRequestEvent` (`server/internal/handler/gitlab.go:452`) is not a
+parallel implementation — it calls the identical `extractIdentifiers`
+(`gitlab.go:462`) and `extractClosingIdentifiers` (`gitlab.go:464`) functions
+cited above, then `LinkIssueToPullRequest` (`gitlab.go:489`) and
+`advanceIssueToDone` (`gitlab.go:521`), the same functions the GitHub path
+calls. Every rule in this section (link vs close-intent, `reference_only`,
+branch exclusion for close-intent) applies unchanged to a GitLab MR's title/
+description/source-branch. The row this writes to `github_pull_request`
+carries `provider = "gitlab"` (vs `"github"`), the only field that
+distinguishes a GitLab MR from a GitHub PR in `multica issue pull-requests`'
+response — see the PR response shape section above.
 
 ## Status side effects (enqueue contracts)
 
