@@ -378,14 +378,14 @@
   },
   "webhooks": {
     "section_header": "Webhook",
-    "description_workspace": "このワークスペース内のいずれかの issue のステータスが変わるたびに、外部 URL へ署名付きの HTTP POST を送信します。",
+    "description_workspace": "このワークスペースで購読中のイベントが発生するたびに、外部 URL へ署名付きの HTTP POST を送信します。",
     "add_label": "エンドポイント URL",
     "add_button": "追加",
     "events_label": "イベント",
     "event_descriptions": {
       "issue_status_changed": "issue のステータスが変わる",
-      "issue_assigned": "issue の担当者が変わる",
-      "comment_created": "issue に新しいコメントが追加される"
+      "issue_assignee_changed": "issue の担当者が変わる",
+      "comment_created": "issue に新しいコメントが追加される（コメント本文全体を含む）"
     },
     "signature_hint": "各リクエストは HMAC-SHA256 で署名され、X-Multica-Signature-256 ヘッダーに付与されます。",
     "events_selected_count": "{{count}} 件のイベント",

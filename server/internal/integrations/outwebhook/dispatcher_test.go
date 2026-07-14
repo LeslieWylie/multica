@@ -356,7 +356,7 @@ func TestDispatchDeliversToMatchingSubscriptions(t *testing.T) {
 }
 
 // TestDispatchAssignedDeliversToMatchingSubscriptions mirrors
-// TestDispatchDeliversToMatchingSubscriptions for issue.assigned: workspace-
+// TestDispatchDeliversToMatchingSubscriptions for issue.assignee_changed: workspace-
 // level + matching project-level subscriptions fire, a different project's
 // subscription does not.
 func TestDispatchAssignedDeliversToMatchingSubscriptions(t *testing.T) {
@@ -365,14 +365,14 @@ func TestDispatchAssignedDeliversToMatchingSubscriptions(t *testing.T) {
 	defer srv.Close()
 
 	store := &fakeStore{subs: []db.WebhookSubscription{
-		sub(t, subID1, "", []string{EventIssueAssigned}, srv.URL),
-		sub(t, projA, projA, []string{EventIssueAssigned}, srv.URL),
-		sub(t, projB, projB, []string{EventIssueAssigned}, srv.URL),
+		sub(t, subID1, "", []string{EventIssueAssigneeChanged}, srv.URL),
+		sub(t, projA, projA, []string{EventIssueAssigneeChanged}, srv.URL),
+		sub(t, projB, projB, []string{EventIssueAssigneeChanged}, srv.URL),
 	}}
 	d := newTestDispatcher(t, store, &http.Client{Timeout: deliveryTimeout})
 
 	c.wg.Add(2) // expect exactly 2 successful deliveries
-	d.DispatchIssueAssigned(IssueAssigned{
+	d.DispatchIssueAssigneeChanged(IssueAssigneeChanged{
 		WorkspaceID:          wsID,
 		ProjectID:            projA,
 		ActorType:            "member",
@@ -405,8 +405,8 @@ func TestDispatchAssignedDeliversToMatchingSubscriptions(t *testing.T) {
 	if err := json.Unmarshal(c.bodies[0], &payload); err != nil {
 		t.Fatalf("unmarshal payload: %v", err)
 	}
-	if payload.Event != EventIssueAssigned {
-		t.Errorf("event = %q, want %q", payload.Event, EventIssueAssigned)
+	if payload.Event != EventIssueAssigneeChanged {
+		t.Errorf("event = %q, want %q", payload.Event, EventIssueAssigneeChanged)
 	}
 	if payload.WorkspaceID != wsID {
 		t.Errorf("workspace_id = %q, want %q", payload.WorkspaceID, wsID)
@@ -417,7 +417,7 @@ func TestDispatchAssignedDeliversToMatchingSubscriptions(t *testing.T) {
 	if payload.Actor.Type != "member" || payload.Actor.ID != "actor-1" {
 		t.Errorf("actor = %+v, want member/actor-1", payload.Actor)
 	}
-	if c.events[0] != EventIssueAssigned {
+	if c.events[0] != EventIssueAssigneeChanged {
 		t.Errorf("X-Multica-Event = %q", c.events[0])
 	}
 	if !webhooksign.Verify("whsec_test", c.sigs[0], c.bodies[0]) {
@@ -426,7 +426,7 @@ func TestDispatchAssignedDeliversToMatchingSubscriptions(t *testing.T) {
 }
 
 // TestDispatchAssignedSkipsUnsubscribedEvent mirrors
-// TestDispatchSkipsUnsubscribedEvent for issue.assigned.
+// TestDispatchSkipsUnsubscribedEvent for issue.assignee_changed.
 func TestDispatchAssignedSkipsUnsubscribedEvent(t *testing.T) {
 	c := &collector{}
 	srv := httptest.NewServer(http.HandlerFunc(c.handler))
@@ -436,7 +436,7 @@ func TestDispatchAssignedSkipsUnsubscribedEvent(t *testing.T) {
 		sub(t, subID1, "", []string{EventIssueStatusChanged}, srv.URL),
 	}}
 	d := newTestDispatcher(t, store, &http.Client{Timeout: deliveryTimeout})
-	d.DispatchIssueAssigned(IssueAssigned{
+	d.DispatchIssueAssigneeChanged(IssueAssigneeChanged{
 		WorkspaceID: wsID,
 		Issue:       map[string]any{"id": "issue-1"},
 	})

@@ -85,13 +85,13 @@ describe("useUpdateWebhookSubscription optimistic cache patch", () => {
 
     result.current.mutate({
       id: "sub-1",
-      events: ["issue.status_changed", "issue.assigned"],
+      events: ["issue.status_changed", "issue.assignee_changed"],
     });
 
     await waitFor(() =>
       expect(cached()[0]?.events).toEqual([
         "issue.status_changed",
-        "issue.assigned",
+        "issue.assignee_changed",
       ]),
     );
   });
@@ -106,13 +106,13 @@ describe("useUpdateWebhookSubscription optimistic cache patch", () => {
       wrapper: createWrapper(qc),
     });
 
-    // First click: check issue.assigned.
+    // First click: check issue.assignee_changed.
     result.current.mutate({
       id: "sub-1",
-      events: ["issue.status_changed", "issue.assigned"],
+      events: ["issue.status_changed", "issue.assignee_changed"],
     });
     await waitFor(() =>
-      expect(cached()[0]?.events).toContain("issue.assigned"),
+      expect(cached()[0]?.events).toContain("issue.assignee_changed"),
     );
 
     // Second click reads the CURRENT cache (post-first-optimistic-patch) to
@@ -124,7 +124,7 @@ describe("useUpdateWebhookSubscription optimistic cache patch", () => {
     await waitFor(() =>
       expect(cached()[0]?.events).toEqual([
         "issue.status_changed",
-        "issue.assigned",
+        "issue.assignee_changed",
         "comment.created",
       ]),
     );
@@ -140,7 +140,7 @@ describe("useUpdateWebhookSubscription optimistic cache patch", () => {
 
     result.current.mutate({
       id: "sub-1",
-      events: ["issue.status_changed", "issue.assigned"],
+      events: ["issue.status_changed", "issue.assignee_changed"],
     });
 
     await waitFor(() => expect(result.current.isError).toBe(true));

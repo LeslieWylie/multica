@@ -107,7 +107,7 @@ func TestWebhookIssuePayload(t *testing.T) {
 // emit: textToPtr/uuidToPtr produce *string, nil when the issue was
 // previously unassigned. registerWebhookListeners reads these two fields
 // straight off the issue:updated payload (not through webhookIssuePayload,
-// which only extracts the CURRENT assignee) to build IssueAssigned's
+// which only extracts the CURRENT assignee) to build IssueAssigneeChanged's
 // PreviousAssigneeType/PreviousAssigneeID.
 func TestAssigneeChangedPrevFieldsExtraction(t *testing.T) {
 	t.Run("previously assigned to a member", func(t *testing.T) {

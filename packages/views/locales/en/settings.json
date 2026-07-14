@@ -378,14 +378,14 @@
   },
   "webhooks": {
     "section_header": "Webhooks",
-    "description_workspace": "Send a signed HTTP POST to an external URL whenever an issue's status changes anywhere in this workspace.",
+    "description_workspace": "Send a signed HTTP POST to an external URL when a subscribed event happens anywhere in this workspace.",
     "add_label": "Endpoint URL",
     "add_button": "Add",
     "events_label": "Events",
     "event_descriptions": {
       "issue_status_changed": "An issue's status changes",
-      "issue_assigned": "An issue's assignee changes",
-      "comment_created": "A comment is added to an issue"
+      "issue_assignee_changed": "An issue's assignee changes",
+      "comment_created": "A comment is added to an issue (includes the full comment body)"
     },
     "signature_hint": "Each request is signed with HMAC-SHA256 in the X-Multica-Signature-256 header.",
     "events_selected_count": "{{count}} events",

@@ -8,7 +8,7 @@
 // code change.
 export type WebhookSubscriptionEvent =
   | "issue.status_changed"
-  | "issue.assigned"
+  | "issue.assignee_changed"
   | "comment.created";
 
 // The full set the UI offers as checkboxes when creating/editing a
@@ -17,7 +17,7 @@ export type WebhookSubscriptionEvent =
 // declaration order in the type above.
 export const WEBHOOK_SUBSCRIPTION_EVENTS: WebhookSubscriptionEvent[] = [
   "issue.status_changed",
-  "issue.assigned",
+  "issue.assignee_changed",
   "comment.created",
 ];
 

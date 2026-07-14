@@ -455,14 +455,14 @@
   },
   "webhooks": {
     "section_header": "Webhook",
-    "description_workspace": "이 워크스페이스의 어떤 issue든 상태가 바뀔 때마다 외부 URL로 서명된 HTTP POST를 전송합니다.",
+    "description_workspace": "이 워크스페이스에서 구독한 이벤트가 발생할 때마다 외부 URL로 서명된 HTTP POST를 전송합니다.",
     "add_label": "엔드포인트 URL",
     "add_button": "추가",
     "events_label": "이벤트",
     "event_descriptions": {
       "issue_status_changed": "issue의 상태가 바뀔 때",
-      "issue_assigned": "issue의 담당자가 바뀔 때",
-      "comment_created": "issue에 새 댓글이 달릴 때"
+      "issue_assignee_changed": "issue의 담당자가 바뀔 때",
+      "comment_created": "issue에 새 댓글이 달릴 때 (댓글 본문 전체 포함)"
     },
     "signature_hint": "각 요청은 HMAC-SHA256으로 서명되어 X-Multica-Signature-256 헤더에 담깁니다.",
     "events_selected_count": "이벤트 {{count}}개",

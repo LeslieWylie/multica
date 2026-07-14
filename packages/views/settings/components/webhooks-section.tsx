@@ -29,8 +29,8 @@ function eventDescription(
   switch (event) {
     case "issue.status_changed":
       return t(($) => $.webhooks.event_descriptions.issue_status_changed);
-    case "issue.assigned":
-      return t(($) => $.webhooks.event_descriptions.issue_assigned);
+    case "issue.assignee_changed":
+      return t(($) => $.webhooks.event_descriptions.issue_assignee_changed);
     case "comment.created":
       return t(($) => $.webhooks.event_descriptions.comment_created);
   }
@@ -211,6 +211,13 @@ export function WebhooksSection() {
                       // already no-ops on it, but disabling here gives the
                       // user a visual reason instead of a silent no-op.
                       const isLastChecked = checked && sub.events.length === 1;
+                      // Also disable while an events PATCH for this
+                      // subscription is already in flight — see
+                      // isEventUpdatePending's doc comment in
+                      // use-webhook-section.ts for why this closes the
+                      // out-of-order-completion race between two rapid
+                      // toggles.
+                      const disabled = isLastChecked || wh.isEventUpdatePending(sub.id);
                       return (
                         <label
                           key={event}
@@ -218,7 +225,7 @@ export function WebhooksSection() {
                         >
                           <Checkbox
                             checked={checked}
-                            disabled={isLastChecked}
+                            disabled={disabled}
                             onCheckedChange={(v) =>
                               wh.handleToggleEvent(sub, event, v === true)
                             }
