@@ -762,6 +762,12 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	// HMAC-SHA256 signature in the handler) and post-install setup callback.
 	r.Post("/api/webhooks/github", h.HandleGitHubWebhook)
 	r.Get("/api/github/setup", h.GitHubSetupCallback)
+	// GitLab merge-request webhook. Unlike the autopilot webhook above, the
+	// path segment is a routing key only (looked up via
+	// GetGitLabIntegrationByID) — the actual credential is the
+	// X-Gitlab-Token header, checked against the integration's
+	// webhook_secret inside the handler.
+	r.Post("/api/webhooks/gitlab/{integrationId}", h.HandleGitLabWebhook)
 	// Slack OAuth callback (no Multica auth in the path — it is hit by Slack's
 	// browser redirect; the workspace/agent/initiator are recovered from the
 	// sealed state). It exchanges the code, upserts the install, then bounces
@@ -883,6 +889,10 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					// the handler strips the management handle and adds a
 					// can_manage hint so the UI can gate connect/disconnect.
 					r.Get("/github/installations", h.ListGitHubInstallations)
+					// GitLab integration — same member-visible rationale as
+					// GitHub's list endpoint above; never reveals
+					// webhook_secret (see ListGitLabIntegrations).
+					r.Get("/gitlab/integrations", h.ListGitLabIntegrations)
 					// Custom runtime profiles — listing/reading is member-visible
 					// (the Runtime page renders for everyone; create/edit/delete
 					// are admin-gated below).
@@ -916,6 +926,15 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					r.Use(middleware.RequireWorkspaceRoleFromURL(queries, "id", "owner", "admin"))
 					r.Get("/github/connect", h.GitHubConnect)
 					r.Delete("/github/installations/{installationId}", h.DeleteGitHubInstallation)
+				})
+
+				// GitLab integration — register/remove is admin-only, same
+				// privilege bar as GitHub connect (the webhook secret lets an
+				// inbound request mutate issue status).
+				r.Group(func(r chi.Router) {
+					r.Use(middleware.RequireWorkspaceRoleFromURL(queries, "id", "owner", "admin"))
+					r.Post("/gitlab/integrations", h.CreateGitLabIntegration)
+					r.Delete("/gitlab/integrations/{integrationId}", h.DeleteGitLabIntegration)
 				})
 
 				// Lark integration. Every endpoint here only requires

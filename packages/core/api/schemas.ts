@@ -21,6 +21,8 @@ import type {
   ListOctoInstallationsResponse,
   OctoInstallation,
   RedeemOctoBindingTokenResponse,
+  GitLabIntegrationResponse,
+  ListGitLabIntegrationsResponse,
   SearchIssuesResponse,
   SearchProjectsResponse,
   Squad,
@@ -1306,4 +1308,43 @@ export const EMPTY_REDEEM_OCTO_BINDING_TOKEN_RESPONSE: RedeemOctoBindingTokenRes
   workspace_id: "",
   installation_id: "",
   octo_uid: "",
+};
+
+// ---------------------------------------------------------------------------
+// GitLab MR integration. Mirrors GitLabIntegrationResponse /
+// ListGitLabIntegrationsResponse in server/internal/handler/gitlab.go. Every
+// field is optional-with-default so an older desktop build keeps parsing when
+// the backend adds fields. webhook_url / webhook_secret are left without a
+// default (undefined, not "") — the server only ever sets them on the create
+// response (see gitlab.go's gitlabIntegrationToResponse), never on list, and
+// collapsing "absent" and "empty string" would make the frontend's "shown
+// once" secret dialog indistinguishable from a real empty secret.
+// ---------------------------------------------------------------------------
+
+export const GitLabIntegrationResponseSchema = z.object({
+  id: z.string().optional().default(""),
+  workspace_id: z.string().optional().default(""),
+  gitlab_host: z.string().optional().default(""),
+  gitlab_project_id: z.number().optional().default(0),
+  gitlab_project_path: z.string().optional().default(""),
+  created_at: z.string().optional().default(""),
+  webhook_url: z.string().optional(),
+  webhook_secret: z.string().optional(),
+}).loose();
+
+export const EMPTY_GITLAB_INTEGRATION_RESPONSE: GitLabIntegrationResponse = {
+  id: "",
+  workspace_id: "",
+  gitlab_host: "",
+  gitlab_project_id: 0,
+  gitlab_project_path: "",
+  created_at: "",
+};
+
+export const ListGitLabIntegrationsResponseSchema = z.object({
+  integrations: z.array(GitLabIntegrationResponseSchema).default([]),
+}).loose();
+
+export const EMPTY_LIST_GITLAB_INTEGRATIONS_RESPONSE: ListGitLabIntegrationsResponse = {
+  integrations: [],
 };

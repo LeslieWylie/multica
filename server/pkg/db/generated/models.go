@@ -442,29 +442,32 @@ type GithubPendingInstallation struct {
 }
 
 type GithubPullRequest struct {
-	ID              pgtype.UUID        `json:"id"`
-	WorkspaceID     pgtype.UUID        `json:"workspace_id"`
-	InstallationID  int64              `json:"installation_id"`
-	RepoOwner       string             `json:"repo_owner"`
-	RepoName        string             `json:"repo_name"`
-	PrNumber        int32              `json:"pr_number"`
-	Title           string             `json:"title"`
-	State           string             `json:"state"`
-	HtmlUrl         string             `json:"html_url"`
-	Branch          pgtype.Text        `json:"branch"`
-	AuthorLogin     pgtype.Text        `json:"author_login"`
-	AuthorAvatarUrl pgtype.Text        `json:"author_avatar_url"`
-	MergedAt        pgtype.Timestamptz `json:"merged_at"`
-	ClosedAt        pgtype.Timestamptz `json:"closed_at"`
-	PrCreatedAt     pgtype.Timestamptz `json:"pr_created_at"`
-	PrUpdatedAt     pgtype.Timestamptz `json:"pr_updated_at"`
-	CreatedAt       pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
-	HeadSha         string             `json:"head_sha"`
-	MergeableState  pgtype.Text        `json:"mergeable_state"`
-	Additions       int32              `json:"additions"`
-	Deletions       int32              `json:"deletions"`
-	ChangedFiles    int32              `json:"changed_files"`
+	ID                pgtype.UUID        `json:"id"`
+	WorkspaceID       pgtype.UUID        `json:"workspace_id"`
+	InstallationID    pgtype.Int8        `json:"installation_id"`
+	RepoOwner         string             `json:"repo_owner"`
+	RepoName          string             `json:"repo_name"`
+	PrNumber          int32              `json:"pr_number"`
+	Title             string             `json:"title"`
+	State             string             `json:"state"`
+	HtmlUrl           string             `json:"html_url"`
+	Branch            pgtype.Text        `json:"branch"`
+	AuthorLogin       pgtype.Text        `json:"author_login"`
+	AuthorAvatarUrl   pgtype.Text        `json:"author_avatar_url"`
+	MergedAt          pgtype.Timestamptz `json:"merged_at"`
+	ClosedAt          pgtype.Timestamptz `json:"closed_at"`
+	PrCreatedAt       pgtype.Timestamptz `json:"pr_created_at"`
+	PrUpdatedAt       pgtype.Timestamptz `json:"pr_updated_at"`
+	CreatedAt         pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
+	HeadSha           string             `json:"head_sha"`
+	MergeableState    pgtype.Text        `json:"mergeable_state"`
+	Additions         int32              `json:"additions"`
+	Deletions         int32              `json:"deletions"`
+	ChangedFiles      int32              `json:"changed_files"`
+	Provider          string             `json:"provider"`
+	ProviderHost      string             `json:"provider_host"`
+	ProviderProjectID pgtype.Int8        `json:"provider_project_id"`
 }
 
 type GithubPullRequestCheckSuite struct {
@@ -475,6 +478,18 @@ type GithubPullRequestCheckSuite struct {
 	Conclusion pgtype.Text        `json:"conclusion"`
 	Status     string             `json:"status"`
 	UpdatedAt  pgtype.Timestamptz `json:"updated_at"`
+}
+
+type GitlabIntegration struct {
+	ID                pgtype.UUID        `json:"id"`
+	WorkspaceID       pgtype.UUID        `json:"workspace_id"`
+	GitlabHost        string             `json:"gitlab_host"`
+	GitlabProjectID   int64              `json:"gitlab_project_id"`
+	GitlabProjectPath string             `json:"gitlab_project_path"`
+	WebhookSecret     string             `json:"webhook_secret"`
+	CreatedByID       pgtype.UUID        `json:"created_by_id"`
+	CreatedAt         pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
 }
 
 type InboxItem struct {
