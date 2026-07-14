@@ -12,6 +12,10 @@ import {
   EMPTY_LIST_OCTO_INSTALLATIONS_RESPONSE,
   EMPTY_OCTO_INSTALLATION,
   EMPTY_REDEEM_OCTO_BINDING_TOKEN_RESPONSE,
+  EMPTY_GITLAB_INTEGRATION_RESPONSE,
+  EMPTY_LIST_GITLAB_INTEGRATIONS_RESPONSE,
+  GitLabIntegrationResponseSchema,
+  ListGitLabIntegrationsResponseSchema,
   InboxUnreadSummarySchema,
   IssueTriggerPreviewSchema,
   ListIssuesResponseSchema,
@@ -515,6 +519,72 @@ describe("Octo schemas", () => {
       { endpoint: "test" },
     );
     expect(bad).toEqual(EMPTY_REDEEM_OCTO_BINDING_TOKEN_RESPONSE);
+  });
+});
+
+describe("GitLab schemas", () => {
+  it("parses a well-formed integration list and preserves unknown fields", () => {
+    const parsed = parseWithFallback(
+      {
+        integrations: [
+          {
+            id: "gi1",
+            workspace_id: "ws1",
+            gitlab_host: "gitlab.example",
+            gitlab_project_id: 1001,
+            gitlab_project_path: "acme/backend",
+            created_at: "2026-01-01T00:00:00Z",
+            future_field: "kept",
+          },
+        ],
+      },
+      ListGitLabIntegrationsResponseSchema,
+      EMPTY_LIST_GITLAB_INTEGRATIONS_RESPONSE,
+      { endpoint: "test" },
+    );
+    expect(parsed.integrations).toHaveLength(1);
+    expect(parsed.integrations[0]?.gitlab_project_id).toBe(1001);
+    expect((parsed.integrations[0] as unknown as Record<string, unknown>).future_field).toBe("kept");
+  });
+
+  it("falls back when integrations is the wrong type", () => {
+    const parsed = parseWithFallback(
+      { integrations: "not-an-array" },
+      ListGitLabIntegrationsResponseSchema,
+      EMPTY_LIST_GITLAB_INTEGRATIONS_RESPONSE,
+      { endpoint: "test" },
+    );
+    expect(parsed).toEqual(EMPTY_LIST_GITLAB_INTEGRATIONS_RESPONSE);
+  });
+
+  it("defaults missing GitLabIntegrationResponse fields rather than throwing", () => {
+    const parsed = parseWithFallback(
+      { id: "gi1" },
+      GitLabIntegrationResponseSchema,
+      EMPTY_GITLAB_INTEGRATION_RESPONSE,
+      { endpoint: "test" },
+    );
+    expect(parsed.id).toBe("gi1");
+    expect(parsed.gitlab_project_id).toBe(0);
+    expect(parsed.gitlab_host).toBe("");
+  });
+
+  it("leaves webhook_url/webhook_secret undefined rather than defaulting to an empty string, since the server only sets them on create", () => {
+    const parsed = parseWithFallback(
+      { id: "gi1", webhook_url: "https://api.example.test/api/webhooks/gitlab/gi1", webhook_secret: "s3cr3t" },
+      GitLabIntegrationResponseSchema,
+      EMPTY_GITLAB_INTEGRATION_RESPONSE,
+      { endpoint: "test" },
+    );
+    expect(parsed.webhook_secret).toBe("s3cr3t");
+
+    const listRow = parseWithFallback(
+      { id: "gi1" },
+      GitLabIntegrationResponseSchema,
+      EMPTY_GITLAB_INTEGRATION_RESPONSE,
+      { endpoint: "test" },
+    );
+    expect(listRow.webhook_secret).toBeUndefined();
   });
 });
 

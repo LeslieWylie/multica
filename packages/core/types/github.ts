@@ -31,6 +31,10 @@ export interface GitHubInstallation {
 export interface GitHubPullRequest {
   id: string;
   workspace_id: string;
+  /** Which provider mirrored this row ("github" or "gitlab"). Optional
+   * because older backends predate the column; treat absence as "github"
+   * (see server's GitHubPullRequestResponse.Provider doc comment). */
+  provider?: "github" | "gitlab";
   repo_owner: string;
   repo_name: string;
   number: number;

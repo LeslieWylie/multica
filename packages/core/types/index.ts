@@ -126,6 +126,11 @@ export type {
   RedeemLarkBindingTokenResponse,
 } from "./lark";
 export type {
+  GitLabIntegrationResponse,
+  ListGitLabIntegrationsResponse,
+  CreateGitLabIntegrationRequest,
+} from "./gitlab";
+export type {
   OctoInstallation,
   ListOctoInstallationsResponse,
   RedeemOctoBindingTokenResponse,
