@@ -1,6 +1,7 @@
 import type { ReactNode } from "react";
+import { useState } from "react";
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { I18nProvider } from "@multica/core/i18n/react";
 import enCommon from "../../locales/en/common.json";
@@ -50,7 +51,26 @@ vi.mock("@multica/core/webhooks/queries", () => ({
 
 vi.mock("@multica/core/webhooks/mutations", () => ({
   useCreateWebhookSubscription: () => ({ mutateAsync: mockCreate, isPending: false }),
-  useUpdateWebhookSubscription: () => ({ mutateAsync: mockUpdate, isPending: false }),
+  // Real useState-backed implementation (not a static {isPending: false}
+  // stub) — needed to test the checkbox-race fix (isEventUpdatePending),
+  // which reads isPending/variables off this hook while a PATCH is in
+  // flight. Mirrors TanStack Query's own semantics: both flip synchronously
+  // with the mutation call and reset once mutateAsync's promise settles.
+  useUpdateWebhookSubscription: () => {
+    const [state, setState] = useState<{
+      isPending: boolean;
+      variables?: { id: string };
+    }>({ isPending: false });
+    const mutateAsync = async (vars: { id: string } & Record<string, unknown>) => {
+      setState({ isPending: true, variables: vars });
+      try {
+        return await mockUpdate(vars);
+      } finally {
+        setState({ isPending: false, variables: vars });
+      }
+    };
+    return { mutateAsync, isPending: state.isPending, variables: state.variables };
+  },
   useDeleteWebhookSubscription: () => ({ mutateAsync: mockDelete, isPending: false }),
 }));
 
@@ -65,6 +85,44 @@ vi.mock("@multica/core/auth", () => {
 
 vi.mock("sonner", () => ({
   toast: { success: vi.fn(), error: vi.fn() },
+}));
+
+// The real dropdown-menu is a Base UI popup (Portal + pointer-based open),
+// which jsdom + userEvent.click doesn't reliably drive. Every other test
+// in this repo that touches DropdownMenu mocks the module the same way —
+// see projects-page.test.tsx / create-project.test.tsx / create-issue.test.tsx
+// — rendering content unconditionally and wiring onCheckedChange straight
+// to onClick, so a plain click exercises the same callback the real
+// component would fire.
+vi.mock("@multica/ui/components/ui/dropdown-menu", () => ({
+  DropdownMenu: ({ children }: { children: React.ReactNode }) => (
+    <>{children}</>
+  ),
+  DropdownMenuTrigger: ({ render }: { render: React.ReactNode }) => (
+    <>{render}</>
+  ),
+  DropdownMenuContent: ({ children }: { children: React.ReactNode }) => (
+    <div>{children}</div>
+  ),
+  DropdownMenuCheckboxItem: ({
+    children,
+    onCheckedChange,
+    checked,
+    disabled,
+  }: {
+    children: React.ReactNode;
+    onCheckedChange?: (checked: boolean) => void;
+    checked?: boolean;
+    disabled?: boolean;
+  }) => (
+    <button
+      type="button"
+      disabled={disabled}
+      onClick={() => onCheckedChange?.(!checked)}
+    >
+      {children}
+    </button>
+  ),
 }));
 
 import { ProjectWebhooksSection } from "./project-webhooks-section";
@@ -133,7 +191,7 @@ describe("ProjectWebhooksSection", () => {
     expect(optionsProjectId.current).toBe(PROJECT_ID);
   });
 
-  it("creates a project-scoped subscription with project_id", async () => {
+  it("creates a project-scoped subscription with project_id and only issue.status_changed by default", async () => {
     mockCreate.mockResolvedValue(makeSub({ secret: "whsec_revealed" }));
     render(<ProjectWebhooksSection projectId={PROJECT_ID} />, {
       wrapper: I18nWrapper,
@@ -151,9 +209,37 @@ describe("ProjectWebhooksSection", () => {
       expect(mockCreate).toHaveBeenCalledWith({
         url: "https://p.example.com/hook",
         project_id: PROJECT_ID,
+        events: ["issue.status_changed"],
       }),
     );
     expect(await screen.findByText("whsec_revealed")).toBeTruthy();
+  });
+
+  it("widens events via the compact events dropdown before creating", async () => {
+    mockCreate.mockResolvedValue(makeSub({ secret: "whsec_revealed" }));
+    render(<ProjectWebhooksSection projectId={PROJECT_ID} />, {
+      wrapper: I18nWrapper,
+    });
+    await userEvent.click(screen.getByRole("button", { name: /Webhooks/i }));
+    await userEvent.click(screen.getByRole("button", { name: /^Add$/i }));
+    await userEvent.type(
+      screen.getByPlaceholderText(/example\.com/i),
+      "https://p.example.com/hook",
+    );
+
+    // Content renders unconditionally under the dropdown-menu mock (see the
+    // module mock's comment) — no "open" step needed. Check issue.assignee_changed to
+    // widen the default single-event selection.
+    await userEvent.click(screen.getByText("issue.assignee_changed"));
+    await userEvent.click(screen.getByRole("button", { name: /^Add$/i }));
+
+    await waitFor(() =>
+      expect(mockCreate).toHaveBeenCalledWith({
+        url: "https://p.example.com/hook",
+        project_id: PROJECT_ID,
+        events: ["issue.status_changed", "issue.assignee_changed"],
+      }),
+    );
   });
 
   it("lists existing project subscriptions when expanded", async () => {
@@ -163,5 +249,40 @@ describe("ProjectWebhooksSection", () => {
     });
     await userEvent.click(screen.getByRole("button", { name: /Webhooks/i }));
     expect(screen.getByText("https://hooks.acme.dev/proj")).toBeTruthy();
+  });
+
+  it("disables a subscription's other event checkboxes while its own PATCH is in flight", async () => {
+    subsRef.current = [
+      makeSub({
+        url: "https://hooks.acme.dev/proj",
+        events: ["issue.status_changed", "issue.assignee_changed"],
+      }),
+    ];
+    let resolveUpdate!: (v: unknown) => void;
+    mockUpdate.mockImplementation(
+      () => new Promise((resolve) => { resolveUpdate = resolve; }),
+    );
+    render(<ProjectWebhooksSection projectId={PROJECT_ID} />, {
+      wrapper: I18nWrapper,
+    });
+    await userEvent.click(screen.getByRole("button", { name: /Webhooks/i }));
+
+    const row = screen.getByText("https://hooks.acme.dev/proj").closest(".group") as HTMLElement;
+    const rowScope = within(row);
+
+    // Toggle comment.created (unchecked) for the row's subscription — its
+    // PATCH never resolves during this test.
+    await userEvent.click(rowScope.getByText("comment.created"));
+
+    // A second click on a DIFFERENT event checkbox for the SAME subscription
+    // must not fire a second concurrent PATCH while the first is still in
+    // flight — same out-of-order-completion race as webhooks-section.tsx's
+    // Checkbox, just via DropdownMenuCheckboxItem here.
+    const statusButton = rowScope.getByText("issue.status_changed").closest("button")!;
+    await waitFor(() => expect(statusButton).toBeDisabled());
+    expect(mockUpdate).toHaveBeenCalledTimes(1);
+
+    resolveUpdate(makeSub({ events: ["issue.status_changed", "issue.assignee_changed", "comment.created"] }));
+    await waitFor(() => expect(statusButton).not.toBeDisabled());
   });
 });
