@@ -28,6 +28,7 @@ import type {
 } from "@multica/core/types";
 import { cn } from "@multica/ui/lib/utils";
 import { useT } from "../../i18n";
+import { GitLabMark } from "../../settings/components/gitlab-mark";
 
 type IssuesT = ReturnType<typeof useT<"issues">>["t"];
 
@@ -141,7 +142,12 @@ function PullRequestRow({ pr }: { pr: GitHubPullRequest }) {
         draftPrefix ? "opacity-80" : null,
       )}
     >
-      <StateIcon className={cn("h-3.5 w-3.5 mt-0.5 shrink-0", cfg.className)} />
+      <span className="relative mt-0.5 shrink-0">
+        <StateIcon className={cn("h-3.5 w-3.5", cfg.className)} />
+        {pr.provider === "gitlab" ? (
+          <GitLabMark className="absolute -bottom-1 -right-1 h-2 w-2 text-muted-foreground" />
+        ) : null}
+      </span>
       <div className="min-w-0 flex-1">
         <p className="text-xs font-medium leading-snug truncate group-hover:text-foreground">
           {pr.title}

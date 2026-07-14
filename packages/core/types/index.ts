@@ -126,6 +126,11 @@ export type {
   RedeemLarkBindingTokenResponse,
 } from "./lark";
 export type {
+  GitLabIntegrationResponse,
+  ListGitLabIntegrationsResponse,
+  CreateGitLabIntegrationRequest,
+} from "./gitlab";
+export type {
   OctoInstallation,
   ListOctoInstallationsResponse,
   RedeemOctoBindingTokenResponse,
@@ -178,6 +183,7 @@ export type {
   OutboundWebhookDeliveryStatus,
   ListOutboundWebhookDeliveriesResponse,
 } from "./webhook-subscription";
+export { WEBHOOK_SUBSCRIPTION_EVENTS } from "./webhook-subscription";
 export type {
   Squad,
   SquadMember,

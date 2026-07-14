@@ -182,6 +182,7 @@ func (h *Handler) notifyParentOfChildDone(ctx context.Context, prev, issue db.Is
 		"issue_assignee_type": textToPtr(parent.AssigneeType),
 		"issue_assignee_id":   uuidToPtr(parent.AssigneeID),
 		"issue_status":        parent.Status,
+		"issue_project_id":    uuidToPtr(parent.ProjectID),
 	})
 
 	// Dispatch the explicit trigger / inbox row for the parent assignee.
