@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import { useState } from "react";
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
@@ -46,7 +47,27 @@ vi.mock("@multica/core/webhooks/queries", () => ({
 
 vi.mock("@multica/core/webhooks/mutations", () => ({
   useCreateWebhookSubscription: () => ({ mutateAsync: mockCreate, isPending: false }),
-  useUpdateWebhookSubscription: () => ({ mutateAsync: mockUpdate, isPending: false }),
+  // A real (non-mocked) useState-backed implementation, not a static
+  // {isPending: false} stub — this is required to test the checkbox-race fix
+  // (isEventUpdatePending), which reads isPending/variables off this hook's
+  // return value while a PATCH is in flight. Mirrors TanStack Query's own
+  // isPending/variables semantics: both flip synchronously with the mutation
+  // call and reset only once mutateAsync's promise settles.
+  useUpdateWebhookSubscription: () => {
+    const [state, setState] = useState<{
+      isPending: boolean;
+      variables?: { id: string };
+    }>({ isPending: false });
+    const mutateAsync = async (vars: { id: string } & Record<string, unknown>) => {
+      setState({ isPending: true, variables: vars });
+      try {
+        return await mockUpdate(vars);
+      } finally {
+        setState({ isPending: false, variables: vars });
+      }
+    };
+    return { mutateAsync, isPending: state.isPending, variables: state.variables };
+  },
   useDeleteWebhookSubscription: () => ({ mutateAsync: mockDelete, isPending: false }),
 }));
 
@@ -146,7 +167,7 @@ describe("WebhooksSection", () => {
       expect(mockCreate).toHaveBeenCalledWith({
         url: "https://new.example.com/hook",
         project_id: null,
-        events: ["issue.status_changed", "issue.assigned"],
+        events: ["issue.status_changed", "issue.assignee_changed"],
       }),
     );
   });
@@ -166,7 +187,7 @@ describe("WebhooksSection", () => {
   it("edits an existing subscription's events", async () => {
     subsRef.current = [makeSub({ events: ["issue.status_changed"] })];
     mockUpdate.mockResolvedValue(
-      makeSub({ events: ["issue.status_changed", "issue.assigned"] }),
+      makeSub({ events: ["issue.status_changed", "issue.assignee_changed"] }),
     );
     render(<WebhooksSection />, { wrapper: I18nWrapper });
 
@@ -175,16 +196,51 @@ describe("WebhooksSection", () => {
     );
     // The row's checklist renders after the create form's, so its checkboxes
     // are the second group of 3 in document order. Index 1 within that group
-    // is issue.assigned (WEBHOOK_SUBSCRIPTION_EVENTS order).
+    // is issue.assignee_changed (WEBHOOK_SUBSCRIPTION_EVENTS order).
     const checkboxes = screen.getAllByRole("checkbox");
     await userEvent.click(checkboxes[3 + 1]!);
 
     await waitFor(() =>
       expect(mockUpdate).toHaveBeenCalledWith({
         id: "sub-1",
-        events: ["issue.status_changed", "issue.assigned"],
+        events: ["issue.status_changed", "issue.assignee_changed"],
       }),
     );
+  });
+
+  it("disables a subscription's other event checkboxes while its own PATCH is in flight", async () => {
+    subsRef.current = [
+      makeSub({ events: ["issue.status_changed", "issue.assignee_changed"] }),
+    ];
+    let resolveUpdate!: (v: unknown) => void;
+    mockUpdate.mockImplementation(
+      () => new Promise((resolve) => { resolveUpdate = resolve; }),
+    );
+    render(<WebhooksSection />, { wrapper: I18nWrapper });
+
+    await userEvent.click(
+      screen.getByRole("button", { name: /^Edit events$/i }),
+    );
+    // Same indexing as the test above: the row's checklist is the second
+    // group of 3 checkboxes. Toggle comment.created (index 2) — its own
+    // PATCH never resolves during this test.
+    const checkboxes = screen.getAllByRole("checkbox");
+    await userEvent.click(checkboxes[3 + 2]!);
+
+    // A second click on a DIFFERENT event checkbox for the SAME subscription
+    // must not fire a second concurrent PATCH — it should be disabled while
+    // the first is still in flight (this is the fix for the checkbox-race:
+    // two in-flight PATCHes replacing the whole events array could otherwise
+    // complete out of send-order and have the earlier one clobber the
+    // later one at the DB). Base UI's Checkbox.Root renders disabled as
+    // data-disabled (a <span role="checkbox">, not a native <input>), so
+    // jest-dom's toBeDisabled() (which only recognizes native form elements)
+    // doesn't apply here.
+    await waitFor(() => expect(checkboxes[3]).toHaveAttribute("data-disabled"));
+    expect(mockUpdate).toHaveBeenCalledTimes(1);
+
+    resolveUpdate(makeSub({ events: ["issue.status_changed"] }));
+    await waitFor(() => expect(checkboxes[3]).not.toHaveAttribute("data-disabled"));
   });
 
   it("hides management UI for non-admin members", () => {

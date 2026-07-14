@@ -29,7 +29,7 @@ import (
 // handler.IssueResponse (handler paths) or a map[string]any (service paths) —
 // and both are handled below.
 //
-// Scope of issue.assigned: it fires for assignment changes published as
+// Scope of issue.assignee_changed: it fires for assignment changes published as
 // issue:updated with assignee_changed=true (single update and batch update).
 // It does NOT fire for the github.go PR-merge path or task.go's
 // broadcastIssueUpdated, neither of which touches assignee — those never set
@@ -42,7 +42,7 @@ import (
 // the receiving end. Project-level subscriptions only receive comments on
 // issues in their own project (issue_project_id, resolved by each publish
 // site from the issue's project_id, same as issue.status_changed/
-// issue.assigned). The comment payload arrives in one of two shapes — the
+// issue.assignee_changed). The comment payload arrives in one of two shapes — the
 // typed handler.CommentResponse (handler paths) or a map[string]any
 // (task.go's agent-comment path) — both handled by webhookCommentPayload.
 func registerWebhookListeners(bus *events.Bus, d *outwebhook.Dispatcher) {
@@ -75,7 +75,7 @@ func registerWebhookListeners(bus *events.Bus, d *outwebhook.Dispatcher) {
 		if assigneeChanged, _ := payload["assignee_changed"].(bool); assigneeChanged {
 			prevAssigneeType := stringFromMap(payload["prev_assignee_type"])
 			prevAssigneeID := stringFromMap(payload["prev_assignee_id"])
-			d.DispatchIssueAssigned(outwebhook.IssueAssigned{
+			d.DispatchIssueAssigneeChanged(outwebhook.IssueAssigneeChanged{
 				WorkspaceID:          e.WorkspaceID,
 				ProjectID:            fields.projectID,
 				ActorType:            e.ActorType,

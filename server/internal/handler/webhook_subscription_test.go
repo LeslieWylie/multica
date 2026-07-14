@@ -73,17 +73,17 @@ func TestValidateWebhookEvents(t *testing.T) {
 		t.Error("unknown event should be rejected")
 	}
 
-	// issue.assigned is accepted and round-trips.
-	b, err = validateWebhookEvents([]string{outwebhook.EventIssueAssigned})
+	// issue.assignee_changed is accepted and round-trips.
+	b, err = validateWebhookEvents([]string{outwebhook.EventIssueAssigneeChanged})
 	if err != nil {
-		t.Fatalf("issue.assigned rejected: %v", err)
+		t.Fatalf("issue.assignee_changed rejected: %v", err)
 	}
 	got = nil
 	if err := json.Unmarshal(b, &got); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if len(got) != 1 || got[0] != outwebhook.EventIssueAssigned {
-		t.Errorf("events = %v, want [%s]", got, outwebhook.EventIssueAssigned)
+	if len(got) != 1 || got[0] != outwebhook.EventIssueAssigneeChanged {
+		t.Errorf("events = %v, want [%s]", got, outwebhook.EventIssueAssigneeChanged)
 	}
 
 	// comment.created is accepted and round-trips.
@@ -102,7 +102,7 @@ func TestValidateWebhookEvents(t *testing.T) {
 	// All three known events together also pass.
 	b, err = validateWebhookEvents([]string{
 		outwebhook.EventIssueStatusChanged,
-		outwebhook.EventIssueAssigned,
+		outwebhook.EventIssueAssigneeChanged,
 		outwebhook.EventCommentCreated,
 	})
 	if err != nil {
