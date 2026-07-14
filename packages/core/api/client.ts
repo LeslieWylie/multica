@@ -243,6 +243,10 @@ import {
   EMPTY_LIST_OCTO_INSTALLATIONS_RESPONSE,
   RedeemOctoBindingTokenResponseSchema,
   EMPTY_REDEEM_OCTO_BINDING_TOKEN_RESPONSE,
+  GitLabIntegrationResponseSchema,
+  EMPTY_GITLAB_INTEGRATION_RESPONSE,
+  ListGitLabIntegrationsResponseSchema,
+  EMPTY_LIST_GITLAB_INTEGRATIONS_RESPONSE,
   CreateFeedbackResponseSchema,
   EMPTY_CREATE_FEEDBACK_RESPONSE,
   InboxUnreadSummarySchema,
@@ -2438,16 +2442,22 @@ export class ApiClient {
 
   // GitLab integration — per-project registration (see gitlab.ts types).
   async listGitLabIntegrations(workspaceId: string): Promise<ListGitLabIntegrationsResponse> {
-    return this.fetch(`/api/workspaces/${workspaceId}/gitlab/integrations`);
+    const raw = await this.fetch<unknown>(`/api/workspaces/${workspaceId}/gitlab/integrations`);
+    return parseWithFallback(raw, ListGitLabIntegrationsResponseSchema, EMPTY_LIST_GITLAB_INTEGRATIONS_RESPONSE, {
+      endpoint: "GET /api/workspaces/:id/gitlab/integrations",
+    });
   }
 
   async createGitLabIntegration(
     workspaceId: string,
     data: CreateGitLabIntegrationRequest,
   ): Promise<GitLabIntegrationResponse> {
-    return this.fetch(`/api/workspaces/${workspaceId}/gitlab/integrations`, {
+    const raw = await this.fetch<unknown>(`/api/workspaces/${workspaceId}/gitlab/integrations`, {
       method: "POST",
       body: JSON.stringify(data),
+    });
+    return parseWithFallback(raw, GitLabIntegrationResponseSchema, EMPTY_GITLAB_INTEGRATION_RESPONSE, {
+      endpoint: "POST /api/workspaces/:id/gitlab/integrations",
     });
   }
 
