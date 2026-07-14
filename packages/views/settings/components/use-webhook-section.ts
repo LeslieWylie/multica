@@ -56,6 +56,15 @@ export interface UseWebhookSectionResult {
     event: WebhookSubscriptionEvent,
     checked: boolean,
   ) => Promise<void>;
+  // True while an events PATCH for this specific subscription is in flight.
+  // Callers disable that subscription's event checkboxes while true — the
+  // full events array is replaced wholesale on each PATCH, so two in-flight
+  // requests for the same subscription could complete out of send-order and
+  // have the earlier-sent (smaller) array clobber the later one at the DB.
+  // Blocking a second toggle until the first settles means at most one
+  // request per subscription is ever in flight, so there is nothing left to
+  // race.
+  isEventUpdatePending: (subId: string) => boolean;
   handleDelete: () => Promise<void>;
   copySecret: (secret: string) => Promise<void>;
 }
@@ -163,6 +172,10 @@ export function useWebhookSection(
     }
   }
 
+  function isEventUpdatePending(subId: string): boolean {
+    return updateMutation.isPending && updateMutation.variables?.id === subId;
+  }
+
   async function handleDelete() {
     if (!deleteTarget) return;
     try {
@@ -201,6 +214,7 @@ export function useWebhookSection(
     handleCreate,
     handleToggle,
     handleToggleEvent,
+    isEventUpdatePending,
     handleDelete,
     copySecret,
   };
