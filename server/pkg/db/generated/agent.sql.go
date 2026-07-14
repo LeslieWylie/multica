@@ -767,9 +767,11 @@ SET status = 'dispatched',
     prepare_lease_expires_at = now() + make_interval(secs => $2::double precision)
 WHERE id = (
     SELECT atq.id FROM agent_task_queue atq
+    LEFT JOIN autopilot_run atq_run ON atq_run.id = atq.autopilot_run_id
     WHERE atq.agent_id = $1 AND atq.status = 'queued'
       AND NOT EXISTS (
           SELECT 1 FROM agent_task_queue active
+          LEFT JOIN autopilot_run active_run ON active_run.id = active.autopilot_run_id
           WHERE active.agent_id = atq.agent_id
             AND active.status IN ('dispatched', 'running', 'waiting_local_directory')
             AND (
@@ -783,11 +785,19 @@ WHERE id = (
                 AND active.chat_session_id IS NULL
                 AND active.autopilot_run_id IS NULL
               )
+              OR (
+                atq.issue_id IS NULL
+                AND atq.chat_session_id IS NULL
+                AND atq_run.autopilot_id IS NOT NULL
+                AND active.issue_id IS NULL
+                AND active.chat_session_id IS NULL
+                AND active_run.autopilot_id = atq_run.autopilot_id
+              )
             )
       )
     ORDER BY atq.priority DESC, atq.created_at ASC
     LIMIT 1
-    FOR UPDATE SKIP LOCKED
+    FOR UPDATE OF atq SKIP LOCKED
 )
 RETURNING id, agent_id, issue_id, status, priority, dispatched_at, started_at, completed_at, result, error, created_at, context, runtime_id, session_id, work_dir, trigger_comment_id, chat_session_id, autopilot_run_id, attempt, max_attempts, parent_task_id, failure_reason, trigger_summary, force_fresh_session, is_leader_task, wait_reason, initiator_user_id, handoff_note, prepare_lease_expires_at, squad_id, runtime_mcp_overlay, escalation_for_task_id, fire_at, originator_user_id, runtime_connected_apps, coalesced_comment_ids
 `
@@ -806,6 +816,18 @@ type ClaimAgentTaskParams struct {
 // "any other quick-create-shaped task" (all four FKs NULL) for the same agent —
 // otherwise a user mashing the create button could fire concurrent quick-creates
 // whose completion lookup would race over "most recent issue by this agent".
+// run_only autopilot tasks (issue_id AND chat_session_id both NULL, autopilot_run_id
+// SET) matched none of the branches above until this one was added: they don't carry
+// an issue/chat FK, and the quick-create branch explicitly requires autopilot_run_id
+// IS NULL, so two run_only tasks for the same agent — e.g. the same webhook-triggered
+// autopilot firing twice in quick succession — could both be claimed and executed
+// concurrently with no serialization at all, bounded only by max_concurrent_tasks.
+// Serializes on matching autopilot_id (resolved via the autopilot_run join below),
+// not on "any run_only-shaped task" — two runs of the SAME autopilot on the same
+// agent still serialize against each other, but two DIFFERENT autopilots assigned to
+// the same agent are allowed to run in parallel (confirmed product semantics: only
+// same-autopilot repeats need the mutex; unrelated autopilots sharing an agent should
+// not queue behind each other).
 func (q *Queries) ClaimAgentTask(ctx context.Context, arg ClaimAgentTaskParams) (AgentTaskQueue, error) {
 	row := q.db.QueryRow(ctx, claimAgentTask, arg.AgentID, arg.PrepareLeaseSecs)
 	var i AgentTaskQueue
