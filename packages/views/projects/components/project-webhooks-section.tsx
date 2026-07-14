@@ -29,6 +29,7 @@ import { WebhookSubscriptionDeliveriesDialog } from "../../webhooks/components/w
 function EventsMenu({
   selected,
   onToggle,
+  pending = false,
   children,
 }: {
   // string[], not WebhookSubscriptionEvent[]: an existing subscription's
@@ -38,6 +39,12 @@ function EventsMenu({
   // below works fine against the wider type.
   selected: string[];
   onToggle: (event: WebhookSubscriptionEvent, checked: boolean) => void;
+  // True while an events PATCH for this subscription is already in flight —
+  // disables every checkbox so a second toggle can't fire a second
+  // concurrent PATCH (see isEventUpdatePending's doc comment in
+  // use-webhook-section.ts). Unused (defaults false) for the create form's
+  // menu, which has no subscription id yet to race against.
+  pending?: boolean;
   children: React.ReactNode;
 }) {
   return (
@@ -55,7 +62,7 @@ function EventsMenu({
             // form's own list is never disabled this way since it's fine
             // (if unusual) to momentarily have zero checked before Add is
             // re-enabled by checking one back.
-            disabled={selected.length === 1 && selected.includes(event)}
+            disabled={(selected.length === 1 && selected.includes(event)) || pending}
             onCheckedChange={(checked) => onToggle(event, checked === true)}
             className="text-xs"
           >
@@ -133,6 +140,7 @@ export function ProjectWebhooksSection({ projectId }: { projectId: string }) {
                     onToggle={(event, checked) =>
                       wh.handleToggleEvent(sub, event, checked)
                     }
+                    pending={wh.isEventUpdatePending(sub.id)}
                   >
                     <button
                       type="button"
