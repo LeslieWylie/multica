@@ -4,6 +4,7 @@ import { webhookKeys } from "./queries";
 import { useWorkspaceId } from "../hooks";
 import type {
   CreateWebhookSubscriptionRequest,
+  ListWebhookSubscriptionsResponse,
   UpdateWebhookSubscriptionRequest,
 } from "../types";
 
@@ -24,11 +25,39 @@ export function useCreateWebhookSubscription(projectId?: string) {
 export function useUpdateWebhookSubscription(projectId?: string) {
   const qc = useQueryClient();
   const wsId = useWorkspaceId();
+  const key = webhookKeys.list(wsId, projectId);
   return useMutation({
     mutationFn: ({ id, ...data }: { id: string } & UpdateWebhookSubscriptionRequest) =>
       api.updateWebhookSubscription(id, data),
+    // Optimistic patch (CLAUDE.md: "patch locally, send request, roll back on
+    // failure, invalidate on settle"). Without this, toggling two event
+    // checkboxes back-to-back computes each PATCH's `events` array from the
+    // subscription object still in the query cache — which for the second
+    // click is a stale pre-first-click snapshot while the first PATCH is still
+    // in flight, so the second request can silently overwrite the first
+    // click's change. Patching the cache synchronously in onMutate means the
+    // component re-renders with the toggled state before the next click can
+    // read stale data.
+    onMutate: async ({ id, ...data }) => {
+      await qc.cancelQueries({ queryKey: key });
+      const previous = qc.getQueryData<ListWebhookSubscriptionsResponse>(key);
+      if (previous) {
+        qc.setQueryData<ListWebhookSubscriptionsResponse>(key, {
+          ...previous,
+          subscriptions: previous.subscriptions.map((s) =>
+            s.id === id ? { ...s, ...data } : s,
+          ),
+        });
+      }
+      return { previous };
+    },
+    onError: (_err, _vars, context) => {
+      if (context?.previous) {
+        qc.setQueryData(key, context.previous);
+      }
+    },
     onSettled: () => {
-      qc.invalidateQueries({ queryKey: webhookKeys.list(wsId, projectId) });
+      qc.invalidateQueries({ queryKey: key });
     },
   });
 }
