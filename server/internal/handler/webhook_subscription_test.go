@@ -72,6 +72,49 @@ func TestValidateWebhookEvents(t *testing.T) {
 	if _, err := validateWebhookEvents([]string{"issue.created"}); err == nil {
 		t.Error("unknown event should be rejected")
 	}
+
+	// issue.assignee_changed is accepted and round-trips.
+	b, err = validateWebhookEvents([]string{outwebhook.EventIssueAssigneeChanged})
+	if err != nil {
+		t.Fatalf("issue.assignee_changed rejected: %v", err)
+	}
+	got = nil
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(got) != 1 || got[0] != outwebhook.EventIssueAssigneeChanged {
+		t.Errorf("events = %v, want [%s]", got, outwebhook.EventIssueAssigneeChanged)
+	}
+
+	// comment.created is accepted and round-trips.
+	b, err = validateWebhookEvents([]string{outwebhook.EventCommentCreated})
+	if err != nil {
+		t.Fatalf("comment.created rejected: %v", err)
+	}
+	got = nil
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(got) != 1 || got[0] != outwebhook.EventCommentCreated {
+		t.Errorf("events = %v, want [%s]", got, outwebhook.EventCommentCreated)
+	}
+
+	// All three known events together also pass.
+	b, err = validateWebhookEvents([]string{
+		outwebhook.EventIssueStatusChanged,
+		outwebhook.EventIssueAssigneeChanged,
+		outwebhook.EventCommentCreated,
+	})
+	if err != nil {
+		t.Fatalf("known events rejected: %v", err)
+	}
+	got = nil
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(got) != 3 {
+		t.Errorf("events = %v, want 3 entries", got)
+	}
 }
 
 func TestGenerateWebhookSecret(t *testing.T) {
