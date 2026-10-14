@@ -205,6 +205,49 @@ describe("ApiClient", () => {
     });
   });
 
+  it("falls back to an empty GitLab integrations list when the server shape drifts", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(JSON.stringify({ integrations: "not-an-array" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      ),
+    );
+
+    const client = new ApiClient("https://api.example.test");
+    await expect(client.listGitLabIntegrations("ws1")).resolves.toEqual({ integrations: [] });
+  });
+
+  it("falls back to an empty GitLab integration when the create response shape drifts", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(JSON.stringify({ gitlab_project_id: "not-a-number" }), {
+          status: 201,
+          headers: { "Content-Type": "application/json" },
+        }),
+      ),
+    );
+
+    const client = new ApiClient("https://api.example.test");
+    await expect(
+      client.createGitLabIntegration("ws1", {
+        gitlab_host: "gitlab.example",
+        gitlab_project_id: 1001,
+        gitlab_project_path: "acme/backend",
+      }),
+    ).resolves.toEqual({
+      id: "",
+      workspace_id: "",
+      gitlab_host: "",
+      gitlab_project_id: 0,
+      gitlab_project_path: "",
+      created_at: "",
+    });
+  });
+
   it("uses the expected HTTP contract for comment trigger preview and suppress", async () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(

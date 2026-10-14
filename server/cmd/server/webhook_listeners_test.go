@@ -101,3 +101,105 @@ func TestWebhookIssuePayload(t *testing.T) {
 		}
 	})
 }
+
+// TestAssigneeChangedPrevFieldsExtraction covers stringFromMap against the
+// exact prev_assignee_type/prev_assignee_id shapes issue.go's publish calls
+// emit: textToPtr/uuidToPtr produce *string, nil when the issue was
+// previously unassigned. registerWebhookListeners reads these two fields
+// straight off the issue:updated payload (not through webhookIssuePayload,
+// which only extracts the CURRENT assignee) to build IssueAssigneeChanged's
+// PreviousAssigneeType/PreviousAssigneeID.
+func TestAssigneeChangedPrevFieldsExtraction(t *testing.T) {
+	t.Run("previously assigned to a member", func(t *testing.T) {
+		payload := map[string]any{
+			"prev_assignee_type": strptr("member"),
+			"prev_assignee_id":   strptr("mem-1"),
+		}
+		if got := stringFromMap(payload["prev_assignee_type"]); got != "member" {
+			t.Errorf("prev_assignee_type = %q, want member", got)
+		}
+		if got := stringFromMap(payload["prev_assignee_id"]); got != "mem-1" {
+			t.Errorf("prev_assignee_id = %q, want mem-1", got)
+		}
+	})
+
+	t.Run("previously unassigned (nil *string)", func(t *testing.T) {
+		var nilType, nilID *string
+		payload := map[string]any{
+			"prev_assignee_type": nilType,
+			"prev_assignee_id":   nilID,
+		}
+		if got := stringFromMap(payload["prev_assignee_type"]); got != "" {
+			t.Errorf("prev_assignee_type = %q, want empty", got)
+		}
+		if got := stringFromMap(payload["prev_assignee_id"]); got != "" {
+			t.Errorf("prev_assignee_id = %q, want empty", got)
+		}
+	})
+
+	t.Run("field absent from payload entirely", func(t *testing.T) {
+		payload := map[string]any{}
+		if got := stringFromMap(payload["prev_assignee_type"]); got != "" {
+			t.Errorf("prev_assignee_type = %q, want empty", got)
+		}
+	})
+}
+
+func TestWebhookCommentPayload(t *testing.T) {
+	t.Run("typed CommentResponse (human/system comment path)", func(t *testing.T) {
+		comment := handler.CommentResponse{
+			ID:         "c1",
+			IssueID:    "issue-1",
+			AuthorType: "member",
+			AuthorID:   "mem-1",
+			Content:    "hello",
+		}
+		f, ok := webhookCommentPayload(comment)
+		if !ok {
+			t.Fatal("expected ok for CommentResponse")
+		}
+		if f.issueID != "issue-1" {
+			t.Errorf("issueID = %q, want issue-1", f.issueID)
+		}
+		if _, isResp := f.comment.(handler.CommentResponse); !isResp {
+			t.Errorf("comment body should pass through as CommentResponse")
+		}
+	})
+
+	t.Run("map shape (agent-authored comment path, task.go)", func(t *testing.T) {
+		m := map[string]any{
+			"id":          "c2",
+			"issue_id":    "issue-2",
+			"author_type": "agent",
+			"author_id":   "agent-1",
+			"content":     "done",
+		}
+		f, ok := webhookCommentPayload(m)
+		if !ok {
+			t.Fatal("expected ok for map")
+		}
+		if f.issueID != "issue-2" {
+			t.Errorf("issueID = %q, want issue-2", f.issueID)
+		}
+		if _, isMap := f.comment.(map[string]any); !isMap {
+			t.Errorf("comment body should pass through as map")
+		}
+	})
+
+	t.Run("map shape missing issue_id", func(t *testing.T) {
+		m := map[string]any{"id": "c3"}
+		f, ok := webhookCommentPayload(m)
+		if !ok || f.issueID != "" {
+			t.Errorf("ok=%v issueID=%q, want ok + empty", ok, f.issueID)
+		}
+	})
+
+	t.Run("unknown shape", func(t *testing.T) {
+		if _, ok := webhookCommentPayload(42); ok {
+			t.Error("expected ok=false for unknown shape")
+		}
+		if _, ok := webhookCommentPayload(nil); ok {
+			t.Error("expected ok=false for nil")
+		}
+	})
+}

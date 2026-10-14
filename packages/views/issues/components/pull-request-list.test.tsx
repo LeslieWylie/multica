@@ -208,4 +208,22 @@ describe("PullRequestList sidebar rows", () => {
     expect(screen.queryByText("PR-D")).not.toBeInTheDocument();
     expect(screen.getByText("Show 1 more")).toBeInTheDocument();
   });
+
+  it("renders no GitLab badge for GitHub PRs (provider omitted)", async () => {
+    mockPRs = [makePR({ title: "GitHub PR" })];
+    renderList();
+    await waitForRender();
+    const row = screen.getByTestId("pull-request-row");
+    // Only the state icon svg — no GitLab mark badge appended.
+    expect(row.querySelectorAll("svg").length).toBe(1);
+  });
+
+  it("renders a GitLab badge on the state icon when provider is gitlab", async () => {
+    mockPRs = [makePR({ title: "GitLab MR", provider: "gitlab" })];
+    renderList();
+    await waitForRender();
+    const row = screen.getByTestId("pull-request-row");
+    // Two svgs: the state icon and the GitLab mark badge.
+    expect(row.querySelectorAll("svg").length).toBe(2);
+  });
 });

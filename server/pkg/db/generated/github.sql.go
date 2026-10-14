@@ -199,8 +199,8 @@ func (q *Queries) GetGitHubInstallationByID(ctx context.Context, id pgtype.UUID)
 }
 
 const getGitHubPullRequest = `-- name: GetGitHubPullRequest :one
-SELECT id, workspace_id, installation_id, repo_owner, repo_name, pr_number, title, state, html_url, branch, author_login, author_avatar_url, merged_at, closed_at, pr_created_at, pr_updated_at, created_at, updated_at, head_sha, mergeable_state, additions, deletions, changed_files FROM github_pull_request
-WHERE workspace_id = $1 AND repo_owner = $2 AND repo_name = $3 AND pr_number = $4
+SELECT id, workspace_id, installation_id, repo_owner, repo_name, pr_number, title, state, html_url, branch, author_login, author_avatar_url, merged_at, closed_at, pr_created_at, pr_updated_at, created_at, updated_at, head_sha, mergeable_state, additions, deletions, changed_files, provider, provider_host, provider_project_id FROM github_pull_request
+WHERE workspace_id = $1 AND provider = 'github' AND repo_owner = $2 AND repo_name = $3 AND pr_number = $4
 `
 
 type GetGitHubPullRequestParams struct {
@@ -210,6 +210,13 @@ type GetGitHubPullRequestParams struct {
 	PrNumber    int32       `json:"pr_number"`
 }
 
+// Filters provider='github' explicitly (migration 155 widened the identity
+// key to include provider/provider_host so a GitHub PR and a GitLab MR can
+// share a repo_owner/repo_name/pr_number string in one workspace) — this
+// query is only ever called from GitHub's own check_suite webhook path
+// (github.go), never GitLab's, so without this filter it would
+// nondeterministically return whichever provider's row the planner picks
+// first when both exist for the same path.
 func (q *Queries) GetGitHubPullRequest(ctx context.Context, arg GetGitHubPullRequestParams) (GithubPullRequest, error) {
 	row := q.db.QueryRow(ctx, getGitHubPullRequest,
 		arg.WorkspaceID,
@@ -242,6 +249,9 @@ func (q *Queries) GetGitHubPullRequest(ctx context.Context, arg GetGitHubPullReq
 		&i.Additions,
 		&i.Deletions,
 		&i.ChangedFiles,
+		&i.Provider,
+		&i.ProviderHost,
+		&i.ProviderProjectID,
 	)
 	return i, err
 }
@@ -514,7 +524,7 @@ checks AS (
     GROUP BY pr_id
 )
 SELECT
-    pr.id, pr.workspace_id, pr.installation_id, pr.repo_owner, pr.repo_name,
+    pr.id, pr.workspace_id, pr.installation_id, pr.provider, pr.provider_host, pr.repo_owner, pr.repo_name,
     pr.pr_number, pr.title, pr.state, pr.html_url, pr.branch, pr.author_login,
     pr.author_avatar_url, pr.merged_at, pr.closed_at, pr.pr_created_at,
     pr.pr_updated_at, pr.head_sha, pr.mergeable_state,
@@ -534,7 +544,9 @@ ORDER BY pr.pr_created_at DESC
 type ListPullRequestsByIssueRow struct {
 	ID              pgtype.UUID        `json:"id"`
 	WorkspaceID     pgtype.UUID        `json:"workspace_id"`
-	InstallationID  int64              `json:"installation_id"`
+	InstallationID  pgtype.Int8        `json:"installation_id"`
+	Provider        string             `json:"provider"`
+	ProviderHost    string             `json:"provider_host"`
 	RepoOwner       string             `json:"repo_owner"`
 	RepoName        string             `json:"repo_name"`
 	PrNumber        int32              `json:"pr_number"`
@@ -585,6 +597,8 @@ func (q *Queries) ListPullRequestsByIssue(ctx context.Context, issueID pgtype.UU
 			&i.ID,
 			&i.WorkspaceID,
 			&i.InstallationID,
+			&i.Provider,
+			&i.ProviderHost,
 			&i.RepoOwner,
 			&i.RepoName,
 			&i.PrNumber,
@@ -705,7 +719,7 @@ INSERT INTO github_pull_request (
     $11, $20,
     $12, $13, $14
 )
-ON CONFLICT (workspace_id, repo_owner, repo_name, pr_number) DO UPDATE SET
+ON CONFLICT (workspace_id, provider, provider_host, repo_owner, repo_name, pr_number) DO UPDATE SET
     installation_id = EXCLUDED.installation_id,
     title = EXCLUDED.title,
     state = EXCLUDED.state,
@@ -726,12 +740,12 @@ ON CONFLICT (workspace_id, repo_owner, repo_name, pr_number) DO UPDATE SET
     deletions     = EXCLUDED.deletions,
     changed_files = EXCLUDED.changed_files,
     updated_at = now()
-RETURNING id, workspace_id, installation_id, repo_owner, repo_name, pr_number, title, state, html_url, branch, author_login, author_avatar_url, merged_at, closed_at, pr_created_at, pr_updated_at, created_at, updated_at, head_sha, mergeable_state, additions, deletions, changed_files
+RETURNING id, workspace_id, installation_id, repo_owner, repo_name, pr_number, title, state, html_url, branch, author_login, author_avatar_url, merged_at, closed_at, pr_created_at, pr_updated_at, created_at, updated_at, head_sha, mergeable_state, additions, deletions, changed_files, provider, provider_host, provider_project_id
 `
 
 type UpsertGitHubPullRequestParams struct {
 	WorkspaceID         pgtype.UUID        `json:"workspace_id"`
-	InstallationID      int64              `json:"installation_id"`
+	InstallationID      pgtype.Int8        `json:"installation_id"`
 	RepoOwner           string             `json:"repo_owner"`
 	RepoName            string             `json:"repo_name"`
 	PrNumber            int32              `json:"pr_number"`
@@ -815,6 +829,9 @@ func (q *Queries) UpsertGitHubPullRequest(ctx context.Context, arg UpsertGitHubP
 		&i.Additions,
 		&i.Deletions,
 		&i.ChangedFiles,
+		&i.Provider,
+		&i.ProviderHost,
+		&i.ProviderProjectID,
 	)
 	return i, err
 }
