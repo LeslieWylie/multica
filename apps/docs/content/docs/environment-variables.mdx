@@ -185,6 +185,7 @@ The daemon runs on the user's local machine, and its config is read from local e
 | `MULTICA_<PROVIDER>_PATH` | matches the CLI name | Path to each AI coding tool's executable (for example `MULTICA_CLAUDE_PATH`) |
 | `MULTICA_<PROVIDER>_MODEL` | empty | Default model for each AI coding tool |
 | `MULTICA_<PROVIDER>_ARGS` | empty | Daemon-wide default CLI arguments for a backend, applied to every task before each agent's own `custom_args`. Supported for `MULTICA_CLAUDE_ARGS`, `MULTICA_CODEX_ARGS`, and `MULTICA_CODEBUDDY_ARGS` |
+| `MULTICA_OPENCLAW_CLI_TIMEOUT_SECONDS` | `5` | Timeout for each `openclaw config ...` call the daemon makes while preparing an OpenClaw task's environment. Raise this if task prep fails with `signal: killed` on slower machines or under concurrent task dispatch — a cold `openclaw` CLI invocation has been measured at 2.4-4.2s alone and 7+s when several tasks start at once. Unset, empty, non-numeric, or non-positive values fall back to the default |
 
 For a full explanation of how each parameter affects daemon behavior, see [Daemon and runtimes](/daemon-runtimes).
 

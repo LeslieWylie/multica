@@ -6,10 +6,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -29,9 +31,44 @@ const openclawConfigFile = "openclaw-config.json"
 const openclawUserSnapshotFile = "openclaw-user-snapshot.json"
 
 // openclawCLITimeout caps each `openclaw config ...` invocation during task
-// setup. The CLI is fast (<200ms normal); 5s leaves headroom for a cold
-// node start without letting a hung CLI stall task dispatch indefinitely.
-const openclawCLITimeout = 5 * time.Second
+// setup. Override with MULTICA_OPENCLAW_CLI_TIMEOUT_SECONDS when the
+// installed openclaw CLI's cold start doesn't fit the default — measured
+// 2.4-4.2s alone and 7+s under concurrent task dispatch on stock hardware,
+// which leaves little headroom above this default and fails outright under
+// concurrency (see openclawCLITimeoutFromEnv). The original assumption that
+// the CLI is fast (<200ms) no longer holds for current openclaw versions;
+// `config` subcommands are not on openclaw's own precomputed-help fast path
+// (unlike --version/--help), so every invocation pays full module load cost.
+var openclawCLITimeout = openclawCLITimeoutFromEnv()
+
+const (
+	envOpenclawCLITimeoutSeconds     = "MULTICA_OPENCLAW_CLI_TIMEOUT_SECONDS"
+	defaultOpenclawCLITimeoutSeconds = 5
+	// maxOpenclawCLITimeoutSeconds caps the env override at the largest
+	// second count that fits in a time.Duration (int64 nanoseconds) without
+	// overflowing. Above this, n * time.Second wraps silently (Go doesn't
+	// panic on integer overflow) and can produce a negative Duration —
+	// context.WithTimeout then sees an already-expired deadline and cancels
+	// immediately, failing every task's OpenClaw prep instead of the
+	// intended "use a very long timeout".
+	maxOpenclawCLITimeoutSeconds = math.MaxInt64 / int64(time.Second)
+)
+
+// openclawCLITimeoutFromEnv reads MULTICA_OPENCLAW_CLI_TIMEOUT_SECONDS (a
+// positive integer number of seconds, capped at maxOpenclawCLITimeoutSeconds)
+// or falls back to defaultOpenclawCLITimeoutSeconds. An unset, empty,
+// non-numeric, non-positive, or overflowing value falls back rather than
+// erroring — this is a task-prep timeout, not a correctness-critical
+// setting, so a malformed override should degrade to the default instead of
+// failing daemon startup.
+func openclawCLITimeoutFromEnv() time.Duration {
+	if raw := strings.TrimSpace(os.Getenv(envOpenclawCLITimeoutSeconds)); raw != "" {
+		if n, err := strconv.ParseInt(raw, 10, 64); err == nil && n > 0 && n <= maxOpenclawCLITimeoutSeconds {
+			return time.Duration(n) * time.Second
+		}
+	}
+	return defaultOpenclawCLITimeoutSeconds * time.Second
+}
 
 // OpenclawConfigPrep is the input to prepareOpenclawConfig. Only OpenclawBin
 // is meaningful in production — Timeout is here for tests that need a tight

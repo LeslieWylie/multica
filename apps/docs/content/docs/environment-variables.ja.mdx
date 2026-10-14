@@ -185,6 +185,7 @@ S3 の前段に CloudFront を置く場合、3 つの変数が適用されます
 | `MULTICA_<PROVIDER>_PATH` | CLI 名に一致 | 各 AI コーディングツールの実行ファイルへのパス（例: `MULTICA_CLAUDE_PATH`） |
 | `MULTICA_<PROVIDER>_MODEL` | 空 | 各 AI コーディングツールのデフォルトモデル |
 | `MULTICA_<PROVIDER>_ARGS` | 空 | バックエンドごとのデーモン全体のデフォルト CLI 引数。各タスクに対し、各エージェント自身の `custom_args` より前に適用される。`MULTICA_CLAUDE_ARGS`、`MULTICA_CODEX_ARGS`、`MULTICA_CODEBUDDY_ARGS` をサポート |
+| `MULTICA_OPENCLAW_CLI_TIMEOUT_SECONDS` | `5` | デーモンが OpenClaw タスクの環境を準備する際に行う各 `openclaw config ...` 呼び出しのタイムアウト。低速なマシンや複数タスクの同時実行時に `signal: killed` でタスク準備が失敗する場合は値を上げてください——`openclaw` CLI のコールドスタートは単体で 2.4-4.2 秒、複数タスク同時起動時は 7 秒以上かかることが確認されています。未設定・空・数値以外・0以下の値はデフォルトにフォールバックします |
 
 各パラメータがデーモンの動作にどう影響するかの完全な説明は、[デーモンとランタイム](/daemon-runtimes)を参照してください。
 
