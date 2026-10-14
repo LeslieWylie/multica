@@ -18,8 +18,12 @@ Every contract below is traced to source in
 
 ## PR linking and close intent are two distinct contracts
 
-The GitHub webhook runs two separate scans over an incoming PR. They are not the
-same gate and they read different fields.
+The GitHub PR webhook and the GitLab MR webhook each run the same two
+separate scans over an incoming PR/MR — GitHub and GitLab share one
+implementation (`extractIdentifiers`/`extractClosingIdentifiers`/
+`LinkIssueToPullRequest`/`advanceIssueToDone`), so everything below applies
+identically to a GitLab merge request; nothing here is GitHub-specific. They
+are not the same gate and they read different fields.
 
 **Linking** scans the PR **title, body, OR branch** for a routable issue key
 (`PREFIX-NUMBER`, e.g. `MUL-2759`). Each match writes an issue ↔ PR link row.
@@ -66,8 +70,8 @@ Related to MUL-2759 in the body (no title/branch)  # links but reference_only �
 
 ### Default for code-changing issue work
 
-When an issue run changes code in a checked-out GitHub repo, the default handoff
-is to open or update a PR before posting the final Multica issue comment, unless
+When an issue run changes code in a checked-out GitHub or GitLab repo, the default handoff
+is to open or update a PR/MR before posting the final Multica issue comment, unless
 the user explicitly asked for a local-only change or no PR. This is a default, not
 an unconditional command: if no code changed, say no PR is needed; if PR creation
 is blocked by auth, failing tests, or missing remote state, report that blocker
@@ -98,6 +102,10 @@ multica issue pull-requests <issue-id> --output json
 
 Returns `{"pull_requests": [...]}`. Each element exposes:
 
+- `provider` — `"github"` or `"gitlab"`. Everything else on the element means
+  the same thing regardless of provider (a GitLab merge request is just a
+  `provider: "gitlab"` row in the same list) — there is no separate
+  "merge-requests" command or response shape to learn.
 - `number`, `html_url`, `title`
 - `state` — the PR lifecycle as a **single enum**, one of `merged`, `closed`,
   `draft`, `open`. There is no separate `draft` or `merged` boolean in the
